@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>식으로 움직이는 무대</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #F7F4EC; overflow: hidden; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body { font-family: system-ui, "Noto Sans KR", sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="식으로 움직이는 무대 게임 화면"></canvas>
+<script>
+/* =====================================================================
+ * 식으로 움직이는 무대 — 식을 세우면 장면이 그 식대로 움직이는 문장제 퍼즐
+ * 구조: CONFIG → 유리수/일차식 → STAGES → state → input → sfx → update → render → loop
+ * 기획: studio/games/equation-stage/gdd.md
+ * ===================================================================== */
+
+// ---- CONFIG: 모든 조정 수치 (GDD 7장 수치 표와 1:1) ----
+const CONFIG = {
+  title: '식으로 움직이는 무대',
+  storageKey: 'equation-stage-progress',
+  playDuration: 2.6,        // s
+  playDurationMax: 4.0,     // s
+  overshootFactor: 3,       // 배
+  resultHold: 0.6,          // s
+  hintAfterWrong: 2,        // 회 (P1)
+  unlockStars: 4,           // 개 (P1)
+  starsFirstTry: 3, starsSecondTry: 2, starsLater: 1,
+  cardMinSize: 48,          // px
+  cardSnapTime: 0.14,       // s
+  dragThreshold: 8,         // px
+  celebrateParticles: 28,   // 개
+  shakeOnMismatch: 6,       // px
+  fontMin: 16,              // px
+  designHeight: 720,        // px, 이보다 낮은 화면은 전체를 축소
+  columnMax: 560,           // px, 본문 열 최대 너비
+  colors: {
+    bg: '#F7F4EC', ink: '#1F2A44', stage: '#FFFFFF', actorA: '#E4572E', actorB: '#17809A',
+    accent: '#F2B134', good: '#2E8B57', bad: '#C0392B', dim: '#6B7488', line: '#D9D4C5', card: '#FFFDF7',
+  },
+  audio: { volume: 0.3 },
+};
+const C = CONFIG.colors;
+
+// ---- 유리수와 일차식 (부동소수 오차 방지) ----
+const gcd = (a, b) => { a = Math.abs(a); b = Math.abs(b); while (b) [a, b] = [b, a % b]; return a || 1; };
+const R = (n, d = 1) => { if (d < 0) { n = -n; d = -d; } const g = gcd(n, d); return { n: n / g, d: d / g }; };
+const rAdd = (p, q) => R(p.n * q.d + q.n * p.d, p.d * q.d);
+const rSub = (p, q) => R(p.n * q.d - q.n * p.d, p.d * q.d);
+const rMul = (p, q) => R(p.n * q.n, p.d * q.d);
+const rDiv = (p, q) => R(p.n * q.d, p.d * q.n);
+const rNum = (p) => p.n / p.d;
+const rFmt = (p) => (p.n < 0 ? '−' : '') + Math.abs(p.n) + (p.d === 1 ? '' : '/' + p.d);
+const L = (a, b) => ({ a, b });                                   // a·x + b
+const lScale = (l, r) => L(rMul(l.a, r), rMul(l.b, r));
+
+// 식 lhs = rhs 를 A·x = B 꼴로 정리
+function normalize(eq) { return { A: rSub(eq.lhs.a, eq.rhs.a), B: rSub(eq.rhs.b, eq.lhs.b) }; }
+// 해 분류: unique / none / infinite
+function solve(eq) {
+  const { A, B } = normalize(eq);
+  if (A.n === 0) return { kind: B.n === 0 ? 'infinite' : 'none' };
+  return { kind: 'unique', x: rDiv(B, A) };
+}
+// 두 식이 동치인가 (A,B 벡터가 비례)
+function equivalent(e1, e2) {
+  const p = normalize(e1), q = normalize(e2);
+  if ((p.A.n === 0 && p.B.n === 0) || (q.A.n === 0 && q.B.n === 0)) return false;
+  return rSub(rMul(p.A, q.B), rMul(q.A, p.B)).n === 0;
+}
+
+// ---- 표시용 포맷 ----
+const trim = (v, k = 2) => String(Math.round(v * 10 ** k) / 10 ** k);
+const fmtKm = (v) => trim(v) + ' km';
+const fmtTime = (h) => (h * 60 >= 120 ? trim(h, 1) + '시간' : trim(h * 60, 1) + '분');
+
+// ---- 유형 1: 따라잡기 ----
+// p = { v1: 먼저 간 사람 시속, d: 출발 시차(분), v2: 따라가는 사람 시속 }
+const CATCH_UP = {
+  typeNo: 1, typeName: '따라잡기', sceneKind: 'line',
+  names: { a: '민지', b: '준호' },
+  problem: (p) => `민지가 [a:시속 ${p.v1} km]로 걸어서 먼저 출발했다. [k:${p.d}분] 뒤 준호가 자전거를 타고 [b:시속 ${p.v2} km]로 같은 길을 따라갔다. 준호는 출발한 지 몇 시간 만에 민지를 따라잡을까?`,
+  unknown: 'x = 준호가 달린 시간 (시간)',
+  frame: (p) => [String(p.v1), '×', '(', { slot: 0 }, ')', '=', String(p.v2), '×', 'x'],
+  cards: (p) => {
+    const d = R(p.d, 60);
+    return [
+      { id: 'minutes', label: `x + ${p.d}`, lin: L(R(1), R(p.d)) },
+      { id: 'ok', label: `x + ${rFmt(d)}`, lin: L(R(1), d) },
+      { id: 'nodelay', label: 'x', lin: L(R(1), R(0)) },
+      { id: 'reversed', label: `x − ${rFmt(d)}`, lin: L(R(1), rSub(R(0), d)) },
+    ];
+  },
+  build: (p, lins) => ({ lhs: lScale(lins[0], R(p.v1)), rhs: L(R(p.v2), R(0)) }),
+  correct: ['ok'],
+  wrongs: (p) => [
+    { slots: ['minutes'], name: '분을 그대로 넣기', hint: `속력이 시속이에요. ${p.d}분은 몇 시간일까요?` },
+    { slots: ['reversed'], name: '시간 관계를 거꾸로', hint: '먼저 출발한 민지가 더 오래 걸었어요. 민지의 시간은 x보다 길까요, 짧을까요?' },
+    { slots: ['nodelay'], name: '시차를 빠뜨리기', hint: `민지가 먼저 걸은 ${p.d}분이 식에 없어요.` },
+  ],
+  // 준호 출발 후 t시간일 때 위치(km)
+  positionsAt: (p, t) => ({ a: p.v1 * (t + p.d / 60), b: p.v2 * t }),
+  answer: (p) => rDiv(rMul(R(p.v1), R(p.d, 60)), R(p.v2 - p.v1)),
+  describe: (p, x) => {
+    const pos = CATCH_UP.positionsAt(p, x);
+    return `준호가 ${fmtTime(x)}을 달리면 준호는 ${fmtKm(pos.b)}, 민지는 ${fmtKm(pos.a)} 지점에 있어요. 차이가 ${fmtKm(Math.abs(pos.a - pos.b))}예요.`;
+  },
+  celebrate: (p, xr) => {
+    const x = rNum(xr);
+    return `준호가 ${fmtTime(x)}(x = ${rFmt(xr)}시간) 만에 ${fmtKm(p.v2 * x)} 지점에서 민지를 따라잡았어요.`;
+  },
+};
+
+// ---- STAGES ----
+const STAGES = [
+  { id: '1-1', type: CATCH_UP, kind: '조립', label: '식 틀에 알맞은 카드를 놓아요',
+    paramSets: [{ v1: 3, d: 20, v2: 9 }] },
+  { id: '1-2', type: CATCH_UP, kind: '오답 탐정', label: '누군가 세운 식이에요. 재생해 보고 틀린 카드를 바꿔요',
+    paramSets: [{ v1: 4, d: 15, v2: 6 }], prefill: ['minutes'] },
+  { id: '1-3', type: CATCH_UP, kind: '조건 바꾸기', label: '숫자가 바뀌었어요. 같은 구조로 식을 세워요',
+    paramSets: [{ v1: 4, d: 30, v2: 12 }, { v1: 3, d: 30, v2: 6 }, { v1: 5, d: 12, v2: 15 }] },
+];
+const LOCKED_TYPES = ['유형 2 · 호수 둘레', '유형 3 · 왕복', '유형 4 · 기차와 터널'];
+
+// ---- state ----
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, K = 1;            // 논리 크기와 축소 배율
+const state = {
+  scene: 'title',                   // title | map | stage | playing | result
+  time: 0, score: 0,                // score = 모은 별 합계
+  stars: {},                        // { '1-1': 3, ... }
+  mapSel: 0, muted: false, hidden: false,
+  stageIndex: -1, stage: null,      // stage = 현재 스테이지 인스턴스
+  play: null, result: null, shake: 0, particles: [],
+  lastParams: {},                   // 조건 바꾸기에서 직전 숫자 묶음 기억
+  buttons: [], drag: null,
+};
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  K = Math.min(1, window.innerHeight / CONFIG.designHeight);
+  W = window.innerWidth / K; H = window.innerHeight / K;
+  canvas.width = window.innerWidth * dpr; canvas.height = window.innerHeight * dpr;
+  ctx.setTransform(dpr * K, 0, 0, dpr * K, 0, 0);
+}
+window.addEventListener('resize', resize);
+
+// ---- 스테이지 진행 ----
+function openStage(index) {
+  const def = STAGES[index];
+  let pi = Math.floor(Math.random() * def.paramSets.length);
+  if (def.paramSets.length > 1 && pi === state.lastParams[def.id]) pi = (pi + 1) % def.paramSets.length;
+  state.lastParams[def.id] = pi;
+  const p = def.paramSets[pi], t = def.type;
+  const frame = t.frame(p);
+  const slotCount = frame.filter((tok) => typeof tok === 'object').length;
+  const cards = t.cards(p).map((c) => ({ ...c, where: 'hand', x: W / 2, y: H, w: 0, h: CONFIG.cardMinSize, tx: 0, ty: 0 }));
+  const slots = new Array(slotCount).fill(null);
+  (def.prefill || []).forEach((id, i) => { slots[i] = id; cards.find((c) => c.id === id).where = i; });
+  const answer = t.answer(p);
+  state.stageIndex = index;
+  state.stage = { def, type: t, p, frame, cards, slots, attempts: 0, sceneT: 0, answer, maxKm: niceMax(t.positionsAt(p, rNum(answer)).b * 1.6), finalGap: false };
+  state.play = null; state.result = null; state.scene = 'stage';
+}
+function niceMax(v) { const steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]; return steps.find((s) => s >= v) || Math.ceil(v); }
+const card = (id) => state.stage.cards.find((c) => c.id === id);
+const slotsFull = () => state.stage.slots.every((s) => s !== null);
+
+function placeCard(id, slotIndex) {
+  const st = state.stage, c = card(id);
+  if (!c || state.scene !== 'stage') return;
+  if (slotIndex === undefined) {
+    slotIndex = st.slots.indexOf(null);
+    if (slotIndex < 0) slotIndex = st.slots.length - 1;      // 빈 칸이 없으면 마지막 칸을 바꾼다
+  }
+  if (c.where !== 'hand') st.slots[c.where] = null;
+  const prev = st.slots[slotIndex];
+  if (prev && prev !== id) card(prev).where = 'hand';
+  st.slots[slotIndex] = id; c.where = slotIndex;
+  st.sceneT = 0; st.finalGap = false;
+  sfx.play('place');
+}
+function removeCard(id) {
+  const st = state.stage, c = card(id);
+  if (!c || c.where === 'hand' || state.scene !== 'stage') return;
+  st.slots[c.where] = null; c.where = 'hand'; st.sceneT = 0; st.finalGap = false;
+  sfx.play('pick');
+}
+function resetSlots() {
+  if (state.scene !== 'stage') return;
+  const st = state.stage;
+  st.slots.forEach((id) => { if (id) card(id).where = 'hand'; });
+  st.slots.fill(null); st.sceneT = 0; st.finalGap = false;
+}
+
+// 식을 풀어 재생을 시작한다
+function playEquation() {
+  const st = state.stage;
+  if (state.scene !== 'stage' || !slotsFull()) return;
+  const untouched = st.def.prefill && st.def.prefill.every((id, i) => st.slots[i] === id);
+  if (!untouched) st.attempts++;
+  const t = st.type, p = st.p;
+  const linsOf = (ids) => ids.map((id) => t.cards(p).find((c) => c.id === id).lin);
+  const eq = t.build(p, linsOf(st.slots));
+  const isCorrect = equivalent(eq, t.build(p, linsOf(t.correct)));
+  const wrong = t.wrongs(p).find((w) => equivalent(eq, t.build(p, linsOf(w.slots))));
+  const sol = solve(eq);
+  const outcome = { isCorrect, wrong, sol };
+  if (sol.kind !== 'unique' || rNum(sol.x) < 0) { finishPlay(outcome); return; }   // 재생할 수 없는 해
+  const x = rNum(sol.x), xc = rNum(st.answer);
+  const overshoot = x > xc * CONFIG.overshootFactor;
+  const dur = overshoot ? CONFIG.playDurationMax : CONFIG.playDuration * Math.min(1.3, Math.max(0.35, x / xc));
+  state.play = { t: 0, dur, x, hold: CONFIG.resultHold, outcome };
+  state.scene = 'playing';
+  sfx.play('start');
+}
+function skipPlay() { if (state.scene === 'playing') { state.play.t = state.play.dur; state.play.hold = 0; } }
+
+function finishPlay(outcome) {
+  const st = state.stage, t = st.type, p = st.p, { sol, isCorrect, wrong } = outcome;
+  const res = { kind: '', title: '', lines: [], hint: '', stars: 0 };
+  if (isCorrect) {
+    res.kind = 'correct'; res.title = '딱 맞았어요!';
+    res.lines = [t.celebrate(p, sol.x)];
+    res.stars = st.attempts === 1 ? CONFIG.starsFirstTry : st.attempts === 2 ? CONFIG.starsSecondTry : CONFIG.starsLater;
+    state.stars[st.def.id] = Math.max(state.stars[st.def.id] || 0, res.stars);
+    state.score = Object.values(state.stars).reduce((a, b) => a + b, 0);
+    st.sceneT = rNum(sol.x);
+    burst(); sfx.play('correct');
+  } else {
+    state.shake = CONFIG.shakeOnMismatch; sfx.play('mismatch');
+    if (sol.kind !== 'unique') {
+      res.kind = 'undetermined'; res.title = 'x가 정해지지 않아요';
+      res.lines = [sol.kind === 'none' ? '이 식을 만족하는 x가 없어요.' : '어떤 x를 넣어도 성립하는 식이에요.'];
+    } else if (rNum(sol.x) < 0) {
+      res.kind = 'negative'; res.title = '출발할 수 없어요';
+      res.lines = [`식을 풀면 x = ${rFmt(sol.x)}이에요. 달린 시간이 음수일 수는 없어요.`];
+    } else {
+      res.kind = 'mismatch'; res.title = '어긋났어요';
+      res.lines = [`식을 풀면 x = ${rFmt(sol.x)}이에요.`, t.describe(p, rNum(sol.x))];
+      st.sceneT = rNum(sol.x); st.finalGap = true;
+    }
+    res.hint = wrong ? wrong.hint : '문제의 조건을 장면과 하나씩 맞춰 보세요.';
+  }
+  state.play = null; state.result = res; state.scene = 'result';
+}
+
+function resultAction() {
+  if (state.scene !== 'result') return;
+  if (state.result.kind === 'correct') {
+    if (state.stageIndex + 1 < STAGES.length) openStage(state.stageIndex + 1);
+    else { state.scene = 'map'; state.mapSel = 0; }
+  } else { state.result = null; state.scene = 'stage'; state.stage.sceneT = 0; state.stage.finalGap = false; }
+}
+function goBack() {
+  if (state.scene === 'map') state.scene = 'title';
+  else if (state.scene !== 'title') { state.scene = 'map'; state.mapSel = Math.max(0, state.stageIndex); state.play = null; state.result = null; }
+}
+function primaryAction() {
+  sfx.unlock();
+  if (state.scene === 'title') state.scene = 'map';
+  else if (state.scene === 'map') openStage(state.mapSel);
+  else if (state.scene === 'stage') playEquation();
+  else if (state.scene === 'playing') skipPlay();
+  else if (state.scene === 'result') resultAction();
+}
+
+// ---- input: 키보드 + 포인터(터치) ----
+window.addEventListener('keydown', (e) => {
+  const k = e.key;
+  if (k === 'Enter' || k === ' ') { e.preventDefault(); primaryAction(); }
+  else if (k === 'Escape') goBack();
+  else if (k === 'm' || k === 'M') state.muted = !state.muted;
+  else if (state.scene === 'map' && (k === 'ArrowRight' || k === 'ArrowDown')) state.mapSel = (state.mapSel + 1) % STAGES.length;
+  else if (state.scene === 'map' && (k === 'ArrowLeft' || k === 'ArrowUp')) state.mapSel = (state.mapSel + STAGES.length - 1) % STAGES.length;
+  else if (state.scene === 'stage') {
+    if (k === 'r' || k === 'R') resetSlots();
+    else if (k === 'Backspace') { const filled = state.stage.slots.filter(Boolean); if (filled.length) removeCard(filled[filled.length - 1]); }
+    else if (/^[1-9]$/.test(k)) { const hand = state.stage.cards.filter((c) => c.where === 'hand'); const c = hand[Number(k) - 1]; if (c) placeCard(c.id); }
+  }
+});
+const pt = (e) => ({ x: e.clientX / K, y: e.clientY / K });
+const inRect = (p, r, pad = 0) => p.x >= r.x - pad && p.x <= r.x + r.w + pad && p.y >= r.y - pad && p.y <= r.y + r.h + pad;
+
+canvas.addEventListener('pointerdown', (e) => {
+  sfx.unlock();
+  const p = pt(e);
+  if (state.scene === 'stage') {
+    const c = [...state.stage.cards].reverse().find((cd) => inRect(p, cd));
+    if (c) { state.drag = { id: c.id, sx: p.x, sy: p.y, ox: p.x - c.x, oy: p.y - c.y, moved: false }; return; }
+  }
+  const b = [...state.buttons].reverse().find((bt) => inRect(p, bt));
+  if (b) b.onTap();
+  else if (state.scene === 'title' || state.scene === 'playing') primaryAction();
+});
+canvas.addEventListener('pointermove', (e) => {
+  const d = state.drag; if (!d) return;
+  const p = pt(e), c = card(d.id);
+  if (!d.moved && Math.hypot(p.x - d.sx, p.y - d.sy) > CONFIG.dragThreshold) { d.moved = true; sfx.play('pick'); }
+  if (d.moved) { c.x = p.x - d.ox; c.y = p.y - d.oy; }
+});
+function endDrag(e) {
+  const d = state.drag; if (!d) return;
+  state.drag = null;
+  const c = card(d.id), p = pt(e);
+  if (!d.moved) { if (c.where === 'hand') placeCard(c.id); else removeCard(c.id); return; }
+  const si = (state.slotRects || []).findIndex((r) => inRect(p, r, 14));
+  if (si >= 0) placeCard(c.id, si); else if (c.where !== 'hand') removeCard(c.id);
+}
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+document.addEventListener('visibilitychange', () => { state.hidden = document.hidden; });
+
+// ---- sfx: WebAudio 합성 ----
+const sfx = {
+  ac: null,
+  unlock() { if (!this.ac) { try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch {} } this.ac?.resume?.(); },
+  tone(f0, f1, dur, type, delay = 0, vol = 1) {
+    const t = this.ac.currentTime + delay, o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(CONFIG.audio.volume * vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(this.ac.destination); o.start(t); o.stop(t + dur);
+  },
+  play(name) {
+    if (state.muted || !this.ac) return;
+    const j = 1 + (Math.random() - 0.5) * 0.1;
+    if (name === 'pick') this.tone(520 * j, 620 * j, 0.06, 'triangle');
+    else if (name === 'place') this.tone(440 * j, 330 * j, 0.08, 'triangle');
+    else if (name === 'start') this.tone(330, 660, 0.18, 'sine');
+    else if (name === 'mismatch') this.tone(220, 160, 0.22, 'sawtooth', 0, 0.5);
+    else if (name === 'correct') [523, 659, 784].forEach((f, i) => this.tone(f, f, 0.16, 'sine', i * 0.13));
+  },
+};
+
+// ---- update ----
+function burst() {
+  const sc = state.sceneRect || { x: W / 2, y: H / 3, w: 0, h: 0 };
+  for (let i = 0; i < CONFIG.celebrateParticles; i++) {
+    const a = Math.random() * Math.PI * 2, s = 80 + Math.random() * 220;
+    state.particles.push({ x: sc.x + sc.w / 2, y: sc.y + sc.h / 2, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 120, life: 0.9 + Math.random() * 0.5,
+      color: [C.accent, C.good, C.actorA, C.actorB][i % 4] });
+  }
+}
+function update(dt) {
+  if (state.hidden) return;
+  state.time += dt;
+  if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 24);
+  for (const q of state.particles) { q.life -= dt; q.vy += 520 * dt; q.x += q.vx * dt; q.y += q.vy * dt; }
+  state.particles = state.particles.filter((q) => q.life > 0);
+
+  if (state.scene === 'playing') {
+    const pl = state.play;
+    pl.t = Math.min(pl.dur, pl.t + dt);
+    const u = pl.t / pl.dur, ease = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    state.stage.sceneT = ease * pl.x;
+    if (pl.t >= pl.dur) { pl.hold -= dt; if (pl.hold <= 0) finishPlay(pl.outcome); }
+  }
+  if (state.stage) {
+    const f = Math.min(1, dt / CONFIG.cardSnapTime);
+    for (const c of state.stage.cards) {
+      if (state.drag && state.drag.id === c.id && state.drag.moved) continue;
+      c.x += (c.tx - c.x) * f; c.y += (c.ty - c.y) * f;
+    }
+  }
+}
+
+// ---- render helpers ----
+const FONT = 'system-ui, "Noto Sans KR", sans-serif';
+function setFont(size, weight = 500) { ctx.font = `${weight} ${size}px ${FONT}`; }
+function text(str, x, y, size, color = C.ink, align = 'left', weight = 500) {
+  setFont(size, weight); ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(str, x, y);
+}
+function rr(x, y, w, h, r, fill, stroke, lw = 1.5, dash) {
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.setLineDash(dash || []); ctx.stroke(); ctx.setLineDash([]); }
+}
+// [a:..] [b:..] [k:..] 표시가 있는 문장을 단어 단위로 줄바꿈해 그린다. 줄 수를 돌려준다.
+function richText(str, x, y, maxW, size, lineH, draw = true) {
+  const colorOf = { a: C.actorA, b: C.actorB, k: '#9A6A00' };
+  const words = [];
+  str.replace(/\[([abk]):([^\]]+)\]|([^\[]+)/g, (m, key, marked, plain) => {
+    if (marked) words.push({ t: marked.replace(/ /g, ' '), color: colorOf[key], bold: true, glue: true });
+    else plain.split(/(\s+)/).forEach((w) => { if (w) words.push({ t: w, color: C.ink, space: /^\s+$/.test(w) }); });
+  });
+  let cx = x, line = 0;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    setFont(size, w.bold ? 700 : 500);
+    const ww = w.space ? ctx.measureText(' ').width : ctx.measureText(w.t).width;
+    if (w.space) { if (cx > x) cx += ww; continue; }
+    if (cx + ww > x + maxW && cx > x) { cx = x; line++; }
+    if (draw) { ctx.fillStyle = w.color; ctx.fillText(w.t, cx, y + line * lineH + lineH / 2); }
+    cx += ww;
+  }
+  return line + 1;
+}
+function wrapPlain(str, maxW, size, weight = 500) {
+  setFont(size, weight);
+  const out = []; let cur = '';
+  for (const w of str.split(' ')) {
+    const next = cur ? cur + ' ' + w : w;
+    if (ctx.measureText(next).width > maxW && cur) { out.push(cur); cur = w; } else cur = next;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+function button(id, x, y, w, h, label, onTap, opt = {}) {
+  const on = opt.enabled !== false;
+  rr(x, y, w, h, opt.radius ?? 12, opt.fill ?? (on ? C.ink : C.line), opt.stroke);
+  text(label, x + w / 2, y + h / 2 + 1, opt.size ?? 18, opt.color ?? (on ? '#FFFFFF' : C.dim), 'center', 700);
+  if (on) state.buttons.push({ id, x, y, w, h, onTap });
+}
+function stars(n, cx, y, size) {
+  setFont(size, 700); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (let i = 0; i < 3; i++) { ctx.fillStyle = i < n ? C.accent : C.line; ctx.fillText('★', cx + (i - 1) * size * 1.1, y); }
+}
+function column() { const w = Math.min(W, CONFIG.columnMax); return { x: (W - w) / 2 + 16, w: w - 32 }; }
+
+// ---- render: 화면별 ----
+function renderTitle() {
+  const col = column(), cx = W / 2;
+  text(CONFIG.title, cx, H * 0.26, 30, C.ink, 'center', 800);
+  wrapPlain('식을 세우면 장면이 그 식대로 움직여요. 맞는 식은 딱 맞아떨어지고, 틀린 식은 눈에 보이게 어긋나요.', col.w - 24, 17)
+    .forEach((ln, i) => text(ln, cx, H * 0.26 + 52 + i * 26, 17, C.dim, 'center'));
+  // 미니 장면
+  const y = H * 0.52, x0 = col.x + 20, x1 = col.x + col.w - 20, u = (state.time % 3) / 3, e = Math.min(1, u * 1.4);
+  ctx.strokeStyle = C.line; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+  const meet = x0 + (x1 - x0) * 0.7;
+  ctx.fillStyle = C.actorA; ctx.beginPath(); ctx.arc(x0 + (x1 - x0) * 0.35 + (meet - x0 - (x1 - x0) * 0.35) * e, y - 16, 10, 0, 7); ctx.fill();
+  rr(x0 + (meet - x0) * e - 10, y + 6, 20, 20, 5, C.actorB);
+  button('start', cx - 110, H * 0.68, 220, 56, '시작', primaryAction, { size: 20 });
+  text('Enter 또는 화면 탭', cx, H * 0.68 + 80, 16, C.dim, 'center');
+}
+
+function renderTopBar(title) {
+  button('back', 8, 4, 48, 48, '←', goBack, { fill: 'transparent', color: C.ink, size: 24 });
+  text(title, W / 2, 28, 18, C.ink, 'center', 700);
+  button('mute', W - 56, 4, 48, 48, state.muted ? '🔇' : '🔊', () => { state.muted = !state.muted; }, { fill: 'transparent', color: C.ink, size: 20 });
+}
+
+function renderMap() {
+  const col = column();
+  renderTopBar('스테이지 선택');
+  let y = 68;
+  text('유형 1 · 따라잡기', col.x, y + 12, 20, C.ink, 'left', 800);
+  text(`★ ${state.score} / ${STAGES.length * 3}`, col.x + col.w, y + 12, 16, C.dim, 'right', 700);
+  y += 40;
+  STAGES.forEach((s, i) => {
+    const sel = i === state.mapSel, h = 76;
+    rr(col.x, y, col.w, h, 14, C.stage, sel ? C.ink : C.line, sel ? 2.5 : 1.5);
+    text(s.id, col.x + 18, y + h / 2, 20, C.actorB, 'left', 800);
+    text(s.kind, col.x + 66, y + 26, 18, C.ink, 'left', 700);
+    text(['식 조립하고 재생하기', '틀린 식을 찾아 고치기', '바뀐 숫자로 다시 세우기'][i], col.x + 66, y + 52, 16, C.dim);
+    stars(state.stars[s.id] || 0, col.x + col.w - 52, y + h / 2, 20);
+    state.buttons.push({ id: 'stage' + i, x: col.x, y, w: col.w, h, onTap: () => { state.mapSel = i; openStage(i); } });
+    y += h + 12;
+  });
+  y += 12;
+  LOCKED_TYPES.forEach((name) => {
+    rr(col.x, y, col.w, 52, 14, 'transparent', C.line, 1.5, [6, 5]);
+    text(name, col.x + 18, y + 26, 17, C.dim, 'left', 700);
+    text('준비 중', col.x + col.w - 18, y + 26, 16, C.dim, 'right');
+    y += 62;
+  });
+}
+
+// 장면: 직선 트랙
+function renderScene(r) {
+  const st = state.stage, t = st.type, p = st.p;
+  state.sceneRect = r;
+  rr(r.x, r.y, r.w, r.h, 14, C.stage, C.line);
+  ctx.save(); ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 14); ctx.clip();
+  const x0 = r.x + 34, x1 = r.x + r.w - 26, gy = r.y + r.h * 0.6;
+  const px = (km) => x0 + (km / st.maxKm) * (x1 - x0);
+  // 길과 눈금
+  ctx.strokeStyle = C.line; ctx.lineWidth = 8; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x0, gy); ctx.lineTo(r.x + r.w + 20, gy); ctx.stroke();
+  const tick = st.maxKm <= 3 ? 0.5 : 1;
+  for (let km = 0; km <= st.maxKm + 1e-9; km += tick) {
+    ctx.strokeStyle = C.dim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px(km), gy + 8); ctx.lineTo(px(km), gy + 15); ctx.stroke();
+    text(trim(km), px(km), gy + 28, 13, C.dim, 'center');
+  }
+  text('km', x1 + 4, gy + 44, 13, C.dim, 'right');
+  // 집
+  ctx.fillStyle = C.ink; ctx.beginPath(); ctx.moveTo(x0 - 12, gy - 6); ctx.lineTo(x0, gy - 18); ctx.lineTo(x0 + 12, gy - 6); ctx.closePath(); ctx.fill();
+  ctx.fillRect(x0 - 8, gy - 6, 16, 6);
+  // 인물
+  const pos = t.positionsAt(p, st.sceneT), ax = px(pos.a), bx = px(pos.b);
+  const off = (x) => x > r.x + r.w + 16;
+  const met = Math.abs(pos.a - pos.b) < 1e-9 && st.sceneT > 0;
+  if (met) { ctx.strokeStyle = C.good; ctx.lineWidth = 2; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(ax, r.y + 34); ctx.lineTo(ax, gy + 8); ctx.stroke(); ctx.setLineDash([]); }
+  // 어긋남: 차이 구간 표시
+  if (st.finalGap && !met) {
+    const lo = Math.min(ax, bx), hi = Math.min(Math.max(ax, bx), r.x + r.w);
+    ctx.fillStyle = C.bad; ctx.globalAlpha = 0.16; ctx.fillRect(lo, gy - 5, hi - lo, 10); ctx.globalAlpha = 1;
+    ctx.strokeStyle = C.bad; ctx.lineWidth = 1.5;
+    for (let hx = lo + 4; hx < hi; hx += 8) { ctx.beginPath(); ctx.moveTo(hx, gy + 5); ctx.lineTo(hx + 5, gy - 5); ctx.stroke(); }
+    text(`차이 ${fmtKm(Math.abs(pos.a - pos.b))}`, Math.min((lo + hi) / 2, r.x + r.w - 60), gy - 30, 15, C.bad, 'center', 700);
+  }
+  const bob = state.scene === 'playing' ? Math.sin(state.time * 18) * 2 : 0;
+  if (!off(ax)) { ctx.fillStyle = C.actorA; ctx.beginPath(); ctx.arc(ax, gy - 20 + bob, 11, 0, 7); ctx.fill(); text(t.names.a, ax, gy - 40 + bob, 13, C.actorA, 'center', 700); }
+  if (!off(bx)) { rr(bx - 11, gy - 9 - bob, 22, 22, 6, C.actorB); text(t.names.b, bx, gy + 48, 13, C.actorB, 'center', 700); }
+  ctx.restore();
+  // 화면 밖으로 나간 인물 안내
+  if (off(ax)) text(`${t.names.a} → ${fmtKm(pos.a)}`, r.x + r.w - 14, r.y + 44, 14, C.actorA, 'right', 700);
+  if (off(bx)) text(`${t.names.b} → ${fmtKm(pos.b)}`, r.x + r.w - 14, r.y + 64, 14, C.actorB, 'right', 700);
+  // 경과 시간
+  text(`준호 출발 후 ${fmtTime(st.sceneT)}`, r.x + 14, r.y + 20, 15, C.ink, 'left', 700);
+  if (state.scene === 'playing') text('탭하면 건너뛰기', r.x + r.w - 14, r.y + 20, 13, C.dim, 'right');
+}
+
+// 식 틀: 슬롯 위치를 계산하고 그린다
+function renderFrame(r) {
+  const st = state.stage;
+  setFont(18, 700);
+  st.cards.forEach((c) => { c.w = Math.max(CONFIG.cardMinSize + 8, ctx.measureText(c.label).width + 28); });
+  const slotW = Math.max(...st.cards.map((c) => c.w)) + 8, slotH = CONFIG.cardMinSize + 8, gap = 9;
+  setFont(24, 700);
+  const widths = st.frame.map((tok) => (typeof tok === 'object' ? slotW : ctx.measureText(tok).width));
+  const total = widths.reduce((a, b) => a + b, 0) + gap * (widths.length - 1);
+  const scale = Math.min(1, r.w / total);
+  let x = r.x + (r.w - total * scale) / 2 + (state.shake ? Math.sin(state.time * 60) * state.shake : 0);
+  const cy = r.y + r.h / 2;
+  state.slotRects = [];
+  st.frame.forEach((tok, i) => {
+    const w = widths[i] * scale;
+    if (typeof tok === 'object') {
+      const rect = { x, y: cy - slotH / 2, w, h: slotH };
+      state.slotRects[tok.slot] = rect;
+      rr(rect.x, rect.y, rect.w, rect.h, 10, 'rgba(31,42,68,0.04)', C.dim, 1.5, [6, 5]);
+      if (st.slots[tok.slot] === null) text('?', x + w / 2, cy, 22, C.dim, 'center', 700);
+    } else text(tok, x + w / 2, cy, 24 * scale, C.ink, 'center', 700);
+    x += w + gap * scale;
+  });
+}
+
+// 카드 목표 위치 계산 + 그리기
+function renderCards(handRect) {
+  const st = state.stage, hand = st.cards.filter((c) => c.where === 'hand'), gap = 10;
+  let rowY = handRect.y, i = 0;
+  while (i < hand.length) {                       // 줄바꿈하며 가운데 정렬
+    let j = i, rowW = 0;
+    while (j < hand.length && (j === i || rowW + gap + hand[j].w <= handRect.w)) { rowW += (j === i ? 0 : gap) + hand[j].w; j++; }
+    let x = handRect.x + (handRect.w - rowW) / 2;
+    for (let k = i; k < j; k++) { hand[k].tx = x; hand[k].ty = rowY; x += hand[k].w + gap; }
+    rowY += CONFIG.cardMinSize + gap; i = j;
+  }
+  st.cards.forEach((c) => {
+    if (c.where !== 'hand') { const s = state.slotRects[c.where]; c.tx = s.x + (s.w - c.w) / 2; c.ty = s.y + (s.h - c.h) / 2; }
+  });
+  const dragging = state.drag && state.drag.moved ? state.drag.id : null;
+  const order = [...st.cards].sort((a, b) => (a.id === dragging) - (b.id === dragging));
+  for (const c of order) {
+    const lift = c.id === dragging;
+    if (lift) { ctx.shadowColor = 'rgba(0,0,0,0.25)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 6; }
+    rr(c.x, c.y, c.w, c.h, 10, C.card, C.ink, 2);
+    ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+    text(c.label, c.x + c.w / 2, c.y + c.h / 2 + 1, 18, C.ink, 'center', 700);
+    if (c.where === 'hand' && state.scene === 'stage') {
+      const n = hand.indexOf(c) + 1;
+      if (n > 0 && W > 700) text(String(n), c.x + 9, c.y + 10, 11, C.dim, 'center', 700);   // 넓은 화면: 숫자키 안내
+    }
+  }
+}
+
+function measureResult(w) {
+  const res = state.result;
+  const lines = wrapPlain(res.lines.join(' '), w - 40, 16);
+  const hl = res.hint ? wrapPlain('힌트: ' + res.hint, w - 64, 16, 700) : [];
+  const h = 52 + lines.length * 24 + (hl.length ? hl.length * 24 + 28 : 0) + 12 + 52 + 16;
+  return { lines, hl, h };
+}
+function renderResult(r, m) {
+  const res = state.result, good = res.kind === 'correct';
+  rr(r.x, r.y, r.w, r.h, 16, C.stage, good ? C.good : C.bad, 2.5);
+  let y = r.y + 28;
+  text(res.title, r.x + 20, y, 22, good ? C.good : C.bad, 'left', 800);
+  if (good) stars(res.stars, r.x + r.w - 56, y, 24);
+  y += 24;
+  m.lines.forEach((ln) => { text(ln, r.x + 20, y + 12, 16, C.ink); y += 24; });
+  if (m.hl.length) {
+    y += 8;
+    rr(r.x + 16, y, r.w - 32, m.hl.length * 24 + 12, 10, 'rgba(242,177,52,0.18)');
+    m.hl.forEach((ln, i) => text(ln, r.x + 28, y + 18 + i * 24, 16, C.ink, 'left', 700));
+  }
+  const last = state.stageIndex + 1 >= STAGES.length;
+  button('result', r.x + 16, r.y + r.h - 68, r.w - 32, 52, good ? (last ? '목록으로' : '다음 스테이지') : '다시 해 보기', resultAction,
+    { fill: good ? C.good : C.ink });
+}
+
+function renderStage() {
+  const st = state.stage, col = column();
+  renderTopBar(`${st.def.id} ${st.def.kind}`);
+  let y = 58;
+  // 문제 카드
+  const lines = richText(st.type.problem(st.p), 0, 0, col.w - 28, 16, 24, false);
+  const ph = lines * 24 + 20;
+  rr(col.x, y, col.w, ph, 12, C.stage, C.line);
+  richText(st.type.problem(st.p), col.x + 14, y + 10, col.w - 28, 16, 24);
+  y += ph + 8;
+  text(st.type.unknown, col.x + 4, y + 12, 16, C.actorB, 'left', 700);
+  y += 30;
+  // 아래쪽 고정 영역 높이를 뺀 나머지를 장면에 준다
+  const inResult = state.scene === 'result';
+  const m = inResult ? measureResult(col.w) : null;
+  const bottomH = inResult ? 72 + 8 + m.h + 10 : 24 + 72 + 8 + (CONFIG.cardMinSize * 2 + 10) + 12 + 56 + 14;
+  const sceneH = Math.max(130, Math.min(230, H - y - bottomH - 8));
+  renderScene({ x: col.x, y, w: col.w, h: sceneH });
+  y += sceneH + 8;
+  if (!inResult) { text(st.def.label, col.x + 4, y + 12, 16, C.dim); y += 24; }
+  renderFrame({ x: col.x, y, w: col.w, h: 72 });
+  y += 72 + 8;
+  if (inResult) {
+    renderCards({ x: col.x, y: H + 40, w: col.w, h: 0 });    // 손패는 화면 아래로 내려 둔다
+    renderResult({ x: col.x, y, w: col.w, h: Math.max(m.h, H - y - 10) }, m);
+    return;
+  }
+  const handRect = { x: col.x, y, w: col.w, h: CONFIG.cardMinSize * 2 + 10 };
+  y += handRect.h + 12;
+  renderCards(handRect);
+  const ready = slotsFull() && state.scene === 'stage';
+  button('reset', col.x, y, 56, 56, '↺', resetSlots, { fill: C.stage, stroke: C.line, color: C.ink, size: 24, enabled: state.scene === 'stage' });
+  button('play', col.x + 68, y, col.w - 68, 56, state.scene === 'playing' ? '재생 중…' : '▶ 재생', playEquation, { enabled: ready, size: 20, fill: ready ? C.actorB : C.line });
+}
+
+function render() {
+  state.buttons = [];
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  if (state.scene === 'title') renderTitle();
+  else if (state.scene === 'map') renderMap();
+  else renderStage();
+  for (const q of state.particles) { ctx.globalAlpha = Math.min(1, q.life); ctx.fillStyle = q.color; ctx.fillRect(q.x - 4, q.y - 4, 8, 8); }
+  ctx.globalAlpha = 1;
+}
+
+// ---- loop: 고정 타임스텝 ----
+const STEP = 1 / 60;
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min((now - last) / 1000, 0.1); last = now;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+
+// 디버그 핸들 (플레이테스트 자동화용)
+window.__game = { CONFIG, state, STAGES, api: { openStage, placeCard, removeCard, playEquation, skipPlay, resultAction, solve, equivalent, R, L, rFmt } };
+</script>
+</body>
+</html>
