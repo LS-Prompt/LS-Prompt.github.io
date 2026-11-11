@@ -6,7 +6,7 @@
 <title>식으로 움직이는 무대</title>
 <style>
   html, body { margin: 0; height: 100%; background: #F7F4EC; overflow: hidden; touch-action: none; }
-  canvas { display: block; width: 100vw; height: 100vh; }
+  canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; }
   body { font-family: system-ui, "Noto Sans KR", sans-serif; }
 </style>
 </head>
@@ -26,6 +26,10 @@ const CONFIG = {
   playDuration: 2.6,        // s
   playDurationMax: 4.0,     // s
   overshootFactor: 3,       // 배
+  playScaleMin: 0.35,       // 배, 작은 해의 재생 시간 하한
+  playScaleMax: 1.3,        // 배, 큰 해의 재생 시간 상한
+  trackMargin: 1.6,         // 배, 트랙 길이 = 정답 지점 × 이 값
+  dropPadding: 14,          // px, 슬롯 드롭 판정 여백
   resultHold: 0.6,          // s
   hintAfterWrong: 2,        // 회 (P1)
   unlockStars: 4,           // 개 (P1)
@@ -107,7 +111,8 @@ const CATCH_UP = {
   answer: (p) => rDiv(rMul(R(p.v1), R(p.d, 60)), R(p.v2 - p.v1)),
   describe: (p, x) => {
     const pos = CATCH_UP.positionsAt(p, x);
-    return `준호가 ${fmtTime(x)}을 달리면 준호는 ${fmtKm(pos.b)}, 민지는 ${fmtKm(pos.a)} 지점에 있어요. 차이가 ${fmtKm(Math.abs(pos.a - pos.b))}예요.`;
+    const gap = fmtKm(Math.abs(pos.a - pos.b));
+    return `준호가 ${fmtTime(x)}을 달리면 준호는 ${fmtKm(pos.b)}, 민지는 ${fmtKm(pos.a)} 지점에 있어요. ${pos.b > pos.a ? `준호가 ${gap} 앞질러 갔어요.` : `민지가 아직 ${gap} 앞에 있어요.`}`;
   },
   celebrate: (p, xr) => {
     const x = rNum(xr);
@@ -143,12 +148,14 @@ const state = {
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  K = Math.min(1, window.innerHeight / CONFIG.designHeight);
-  W = window.innerWidth / K; H = window.innerHeight / K;
-  canvas.width = window.innerWidth * dpr; canvas.height = window.innerHeight * dpr;
+  const cw = canvas.clientWidth || window.innerWidth, ch = canvas.clientHeight || window.innerHeight;
+  K = Math.min(1, ch / CONFIG.designHeight);
+  W = cw / K; H = ch / K;
+  canvas.width = cw * dpr; canvas.height = ch * dpr;
   ctx.setTransform(dpr * K, 0, 0, dpr * K, 0, 0);
 }
 window.addEventListener('resize', resize);
+window.visualViewport?.addEventListener('resize', resize);
 
 // ---- 스테이지 진행 ----
 function openStage(index) {
@@ -164,7 +171,7 @@ function openStage(index) {
   (def.prefill || []).forEach((id, i) => { slots[i] = id; cards.find((c) => c.id === id).where = i; });
   const answer = t.answer(p);
   state.stageIndex = index;
-  state.stage = { def, type: t, p, frame, cards, slots, attempts: 0, sceneT: 0, answer, maxKm: niceMax(t.positionsAt(p, rNum(answer)).b * 1.6), finalGap: false };
+  state.stage = { def, type: t, p, frame, cards, slots, attempts: 0, sceneT: 0, answer, maxKm: niceMax(t.positionsAt(p, rNum(answer)).b * CONFIG.trackMargin), finalGap: false };
   state.play = null; state.result = null; state.scene = 'stage';
 }
 function niceMax(v) { const steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]; return steps.find((s) => s >= v) || Math.ceil(v); }
@@ -207,14 +214,14 @@ function playEquation() {
   const t = st.type, p = st.p;
   const linsOf = (ids) => ids.map((id) => t.cards(p).find((c) => c.id === id).lin);
   const eq = t.build(p, linsOf(st.slots));
-  const isCorrect = equivalent(eq, t.build(p, linsOf(t.correct)));
+  const isCorrect = st.slots.every((id, i) => id === t.correct[i]);
   const wrong = t.wrongs(p).find((w) => equivalent(eq, t.build(p, linsOf(w.slots))));
   const sol = solve(eq);
   const outcome = { isCorrect, wrong, sol };
   if (sol.kind !== 'unique' || rNum(sol.x) < 0) { finishPlay(outcome); return; }   // 재생할 수 없는 해
   const x = rNum(sol.x), xc = rNum(st.answer);
   const overshoot = x > xc * CONFIG.overshootFactor;
-  const dur = overshoot ? CONFIG.playDurationMax : CONFIG.playDuration * Math.min(1.3, Math.max(0.35, x / xc));
+  const dur = overshoot ? CONFIG.playDurationMax : CONFIG.playDuration * Math.min(CONFIG.playScaleMax, Math.max(CONFIG.playScaleMin, x / xc));
   state.play = { t: 0, dur, x, hold: CONFIG.resultHold, outcome };
   state.scene = 'playing';
   sfx.play('start');
@@ -273,6 +280,7 @@ function primaryAction() {
 // ---- input: 키보드 + 포인터(터치) ----
 window.addEventListener('keydown', (e) => {
   const k = e.key;
+  if (e.repeat && (k === 'Enter' || k === ' ')) { e.preventDefault(); return; }
   if (k === 'Enter' || k === ' ') { e.preventDefault(); primaryAction(); }
   else if (k === 'Escape') goBack();
   else if (k === 'm' || k === 'M') state.muted = !state.muted;
@@ -284,7 +292,7 @@ window.addEventListener('keydown', (e) => {
     else if (/^[1-9]$/.test(k)) { const hand = state.stage.cards.filter((c) => c.where === 'hand'); const c = hand[Number(k) - 1]; if (c) placeCard(c.id); }
   }
 });
-const pt = (e) => ({ x: e.clientX / K, y: e.clientY / K });
+const pt = (e) => { const b = canvas.getBoundingClientRect(); return { x: (e.clientX - b.left) / K, y: (e.clientY - b.top) / K }; };
 const inRect = (p, r, pad = 0) => p.x >= r.x - pad && p.x <= r.x + r.w + pad && p.y >= r.y - pad && p.y <= r.y + r.h + pad;
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -292,7 +300,7 @@ canvas.addEventListener('pointerdown', (e) => {
   const p = pt(e);
   if (state.scene === 'stage') {
     const c = [...state.stage.cards].reverse().find((cd) => inRect(p, cd));
-    if (c) { state.drag = { id: c.id, sx: p.x, sy: p.y, ox: p.x - c.x, oy: p.y - c.y, moved: false }; return; }
+    if (c) { state.drag = { id: c.id, sx: p.x, sy: p.y, ox: p.x - c.x, oy: p.y - c.y, moved: false }; try { canvas.setPointerCapture(e.pointerId); } catch {} return; }
   }
   const b = [...state.buttons].reverse().find((bt) => inRect(p, bt));
   if (b) b.onTap();
@@ -309,11 +317,11 @@ function endDrag(e) {
   state.drag = null;
   const c = card(d.id), p = pt(e);
   if (!d.moved) { if (c.where === 'hand') placeCard(c.id); else removeCard(c.id); return; }
-  const si = (state.slotRects || []).findIndex((r) => inRect(p, r, 14));
+  const si = (state.slotRects || []).findIndex((r) => inRect(p, r, CONFIG.dropPadding));
   if (si >= 0) placeCard(c.id, si); else if (c.where !== 'hand') removeCard(c.id);
 }
 canvas.addEventListener('pointerup', endDrag);
-canvas.addEventListener('pointercancel', endDrag);
+canvas.addEventListener('pointercancel', () => { state.drag = null; });   // 취소되면 카드는 원래 자리로 돌아간다
 document.addEventListener('visibilitychange', () => { state.hidden = document.hidden; });
 
 // ---- sfx: WebAudio 합성 ----
@@ -502,7 +510,7 @@ function renderScene(r) {
     ctx.fillStyle = C.bad; ctx.globalAlpha = 0.16; ctx.fillRect(lo, gy - 5, hi - lo, 10); ctx.globalAlpha = 1;
     ctx.strokeStyle = C.bad; ctx.lineWidth = 1.5;
     for (let hx = lo + 4; hx < hi; hx += 8) { ctx.beginPath(); ctx.moveTo(hx, gy + 5); ctx.lineTo(hx + 5, gy - 5); ctx.stroke(); }
-    text(`차이 ${fmtKm(Math.abs(pos.a - pos.b))}`, Math.min((lo + hi) / 2, r.x + r.w - 60), gy - 30, 15, C.bad, 'center', 700);
+    text(`${pos.b > pos.a ? t.names.b : t.names.a} +${fmtKm(Math.abs(pos.a - pos.b))}`, Math.min((lo + hi) / 2, r.x + r.w - 60), gy - 30, 15, C.bad, 'center', 700);
   }
   const bob = state.scene === 'playing' ? Math.sin(state.time * 18) * 2 : 0;
   if (!off(ax)) { ctx.fillStyle = C.actorA; ctx.beginPath(); ctx.arc(ax, gy - 20 + bob, 11, 0, 7); ctx.fill(); text(t.names.a, ax, gy - 40 + bob, 13, C.actorA, 'center', 700); }
