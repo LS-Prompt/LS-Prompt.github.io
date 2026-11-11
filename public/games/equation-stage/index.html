@@ -3,148 +3,191 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-<title>식으로 움직이는 무대</title>
+<title>관제센터 X</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #F7F4EC; overflow: hidden; touch-action: none; }
+  html, body { margin: 0; height: 100%; background: #0E1626; overflow: hidden; touch-action: none; }
   canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; }
   body { font-family: system-ui, "Noto Sans KR", sans-serif; }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="식으로 움직이는 무대 게임 화면"></canvas>
+<canvas id="game" aria-label="관제센터 X 게임 화면"></canvas>
 <script>
 /* =====================================================================
- * 식으로 움직이는 무대 — 식을 세우면 장면이 그 식대로 움직이는 문장제 퍼즐
- * 구조: CONFIG → 유리수/일차식 → STAGES → state → input → sfx → update → render → loop
- * 기획: studio/games/equation-stage/gdd.md
+ * 관제센터 X — 식을 세워 작전을 지휘하는 문장제 미션 게임
+ * 구조: CONFIG → 유리수/일차식 → MISSION 데이터 → state → 진행 로직 → input → sfx → update → render → loop
+ * 기획: studio/games/equation-stage/gdd.md (v0.2)
  * ===================================================================== */
 
-// ---- CONFIG: 모든 조정 수치 (GDD 7장 수치 표와 1:1) ----
+// ---- CONFIG (GDD 7장 수치 표와 1:1) ----
 const CONFIG = {
-  title: '식으로 움직이는 무대',
+  title: '관제센터 X',
   storageKey: 'equation-stage-progress',
-  playDuration: 2.6,        // s
-  playDurationMax: 4.0,     // s
-  overshootFactor: 3,       // 배
-  playScaleMin: 0.35,       // 배, 작은 해의 재생 시간 하한
-  playScaleMax: 1.3,        // 배, 큰 해의 재생 시간 상한
-  trackMargin: 1.6,         // 배, 트랙 길이 = 정답 지점 × 이 값
-  dropPadding: 14,          // px, 슬롯 드롭 판정 여백
+  playDuration: 2.6, simDuration: 1.6, playDurationMax: 4.0,     // s
+  playScaleMin: 0.35, playScaleMax: 1.3, overshootFactor: 3, trackMargin: 1.2,
   resultHold: 0.6,          // s
-  hintAfterWrong: 2,        // 회 (P1)
-  unlockStars: 4,           // 개 (P1)
-  starsFirstTry: 3, starsSecondTry: 2, starsLater: 1,
-  cardMinSize: 48,          // px
-  cardSnapTime: 0.14,       // s
-  dragThreshold: 8,         // px
-  celebrateParticles: 28,   // 개
-  shakeOnMismatch: 6,       // px
-  fontMin: 16,              // px
-  designHeight: 720,        // px, 이보다 낮은 화면은 전체를 축소
-  columnMax: 560,           // px, 본문 열 최대 너비
+  rankPoints: { S: 4, A: 3, B: 2, C: 1 },
+  rankOperator: 10, rankSenior: 24, rankChief: 40,
+  maruWrongRate: 0.7,
+  dialogCharsPerSec: 40, dialogMaxLines: 2,
+  lightUpDuration: 1.8,     // s
+  approveHold: 0.4,         // s, 승인 버튼을 누르고 있어야 하는 시간
+  cardMinSize: 48, cardSnapTime: 0.14, dragThreshold: 8, dropPadding: 14,
+  celebrateParticles: 28, shakeOnMismatch: 6, fontMin: 16,
+  designHeight: 720, columnMax: 560,
   colors: {
-    bg: '#F7F4EC', ink: '#1F2A44', stage: '#FFFFFF', actorA: '#E4572E', actorB: '#17809A',
-    accent: '#F2B134', good: '#2E8B57', bad: '#C0392B', dim: '#6B7488', line: '#D9D4C5', card: '#FFFDF7',
+    bg: '#0E1626', panel: '#17233B', grid: '#24324F', ink: '#E8EEF7', dim: '#8A97AD',
+    unit: '#4FC3D9', target: '#FF7A59', amber: '#F2B134', good: '#5CC98A', bad: '#FF5C5C',
   },
   audio: { volume: 0.3 },
 };
 const C = CONFIG.colors;
 
-// ---- 유리수와 일차식 (부동소수 오차 방지) ----
+// ---- 유리수와 일차식 ----
 const gcd = (a, b) => { a = Math.abs(a); b = Math.abs(b); while (b) [a, b] = [b, a % b]; return a || 1; };
 const R = (n, d = 1) => { if (d < 0) { n = -n; d = -d; } const g = gcd(n, d); return { n: n / g, d: d / g }; };
 const rAdd = (p, q) => R(p.n * q.d + q.n * p.d, p.d * q.d);
 const rSub = (p, q) => R(p.n * q.d - q.n * p.d, p.d * q.d);
 const rMul = (p, q) => R(p.n * q.n, p.d * q.d);
 const rDiv = (p, q) => R(p.n * q.d, p.d * q.n);
+const rEq = (p, q) => p.n === q.n && p.d === q.d;
 const rNum = (p) => p.n / p.d;
 const rFmt = (p) => (p.n < 0 ? '−' : '') + Math.abs(p.n) + (p.d === 1 ? '' : '/' + p.d);
 const L = (a, b) => ({ a, b });                                   // a·x + b
-const lScale = (l, r) => L(rMul(l.a, r), rMul(l.b, r));
-
-// 식 lhs = rhs 를 A·x = B 꼴로 정리
+const ZERO = R(0), ONE = R(1);
+const signed = (op, r) => (op === '−' ? rSub(ZERO, r) : r);
 function normalize(eq) { return { A: rSub(eq.lhs.a, eq.rhs.a), B: rSub(eq.rhs.b, eq.lhs.b) }; }
-// 해 분류: unique / none / infinite
 function solve(eq) {
   const { A, B } = normalize(eq);
   if (A.n === 0) return { kind: B.n === 0 ? 'infinite' : 'none' };
   return { kind: 'unique', x: rDiv(B, A) };
 }
-// 두 식이 동치인가 (A,B 벡터가 비례)
 function equivalent(e1, e2) {
   const p = normalize(e1), q = normalize(e2);
   if ((p.A.n === 0 && p.B.n === 0) || (q.A.n === 0 && q.B.n === 0)) return false;
   return rSub(rMul(p.A, q.B), rMul(q.A, p.B)).n === 0;
 }
-
-// ---- 표시용 포맷 ----
 const trim = (v, k = 2) => String(Math.round(v * 10 ** k) / 10 ** k);
 const fmtKm = (v) => trim(v) + ' km';
 const fmtTime = (h) => (h * 60 >= 120 ? trim(h, 1) + '시간' : trim(h * 60, 1) + '분');
 
-// ---- 유형 1: 따라잡기 ----
-// p = { v1: 먼저 간 사람 시속, d: 출발 시차(분), v2: 따라가는 사람 시속 }
-const CATCH_UP = {
-  typeNo: 1, typeName: '따라잡기', sceneKind: 'line',
-  names: { a: '민지', b: '준호' },
-  problem: (p) => `민지가 [a:시속 ${p.v1} km]로 걸어서 먼저 출발했다. [k:${p.d}분] 뒤 준호가 자전거를 타고 [b:시속 ${p.v2} km]로 같은 길을 따라갔다. 준호는 출발한 지 몇 시간 만에 민지를 따라잡을까?`,
-  unknown: 'x = 준호가 달린 시간 (시간)',
-  frame: (p) => [String(p.v1), '×', '(', { slot: 0 }, ')', '=', String(p.v2), '×', 'x'],
-  cards: (p) => {
-    const d = R(p.d, 60);
-    return [
-      { id: 'minutes', label: `x + ${p.d}`, lin: L(R(1), R(p.d)) },
-      { id: 'ok', label: `x + ${rFmt(d)}`, lin: L(R(1), d) },
-      { id: 'nodelay', label: 'x', lin: L(R(1), R(0)) },
-      { id: 'reversed', label: `x − ${rFmt(d)}`, lin: L(R(1), rSub(R(0), d)) },
-    ];
+// ---- 미션 1: 혈청 드론 추격 (따라잡기) ----
+// p = { v1: 구급차 시속, d: 드론 출발 시차(분), v2: 드론 시속, h: 병원까지 km }
+const MISSION = {
+  id: 'm1', name: '혈청 드론 추격', type: '따라잡기',
+  paramSets: {
+    train: [{ v1: 60, d: 10, v2: 90, h: 40 }],
+    live: [{ v1: 60, d: 10, v2: 90, h: 40 }, { v1: 48, d: 15, v2: 72, h: 50 }, { v1: 40, d: 12, v2: 60, h: 30 }],
+    twist: [{ v1: 60, d: 10, v2: 75, h: 40 }],
   },
-  build: (p, lins) => ({ lhs: lScale(lins[0], R(p.v1)), rhs: L(R(p.v2), R(0)) }),
-  correct: ['ok'],
-  wrongs: (p) => [
-    { slots: ['minutes'], name: '분을 그대로 넣기', hint: `속력이 시속이에요. ${p.d}분은 몇 시간일까요?` },
-    { slots: ['reversed'], name: '시간 관계를 거꾸로', hint: '먼저 출발한 민지가 더 오래 걸었어요. 민지의 시간은 x보다 길까요, 짧을까요?' },
-    { slots: ['nodelay'], name: '시차를 빠뜨리기', hint: `민지가 먼저 걸은 ${p.d}분이 식에 없어요.` },
+  call: {
+    train: (p) => [
+      ['lead', `구급차가 혈청을 두고 출발했어. 지금 시속 ${p.v1} km로 병원에 가는 중이다.`],
+      ['lead', `${p.d}분 늦게 드론을 띄울 수 있어. 드론은 시속 ${p.v2} km, 병원은 ${p.h} km 지점.`],
+      ['lead', '드론이 구급차를 언제, 어디서 따라잡는지 식으로 세워 봐.'],
+    ],
+    live: (p) => [
+      ['lead', '또 혈청 호출이다. 이번엔 조건이 달라. 숫자를 잘 봐.'],
+      ['maru', '제가 먼저 식을 세워 봤어요! 맞는지 모의 실행으로 봐 주세요.'],
+    ],
+    twist: (p) => [
+      ['lead', `맞바람이 분다. 드론 속력이 시속 ${p.v2} km로 떨어졌어.`],
+      ['lead', '식을 세우고, 그 답이 상황에 맞는지까지 확인해.'],
+    ],
+  },
+  cards: (p) => [
+    { id: 'v1', base: R(p.v1), cap: '구급차 시속' },
+    { id: 'd', base: R(p.d), cap: '분 늦게' },
+    { id: 'v2', base: R(p.v2), cap: '드론 시속' },
+    { id: 'h', base: R(p.h), cap: '병원 km' },
   ],
-  // 준호 출발 후 t시간일 때 위치(km)
-  positionsAt: (p, t) => ({ a: p.v1 * (t + p.d / 60), b: p.v2 * t }),
-  answer: (p) => rDiv(rMul(R(p.v1), R(p.d, 60)), R(p.v2 - p.v1)),
-  describe: (p, x) => {
-    const pos = CATCH_UP.positionsAt(p, x);
-    const gap = fmtKm(Math.abs(pos.a - pos.b));
-    return `준호가 ${fmtTime(x)}을 달리면 준호는 ${fmtKm(pos.b)}, 민지는 ${fmtKm(pos.a)} 지점에 있어요. ${pos.b > pos.a ? `준호가 ${gap} 앞질러 갔어요.` : `민지가 아직 ${gap} 앞에 있어요.`}`;
+  // 풀 수 있는 미지수마다 식 틀이 다르다. roles: 수 슬롯이 뜻하는 값, op: 올바른 연산
+  unknowns: [
+    { label: '드론이 난 시간', short: 'x = 드론이 난 시간(시간)', relSet: 0,
+      frame: [{ num: 0 }, '×', '(', 'x', { op: 0 }, { num: 1 }, ')', '=', { num: 2 }, '×', 'x'],
+      roles: ['v1', 'delay', 'v2'], op: '+',
+      build: (n, o) => ({ lhs: L(n[0], rMul(n[0], signed(o[0], n[1]))), rhs: L(n[2], ZERO) }),
+      toT: (x, p) => x },
+    { label: '구급차가 달린 시간', short: 'x = 구급차가 달린 시간(시간)', relSet: 0,
+      frame: [{ num: 0 }, '×', 'x', '=', { num: 1 }, '×', '(', 'x', { op: 0 }, { num: 2 }, ')'],
+      roles: ['v1', 'v2', 'delay'], op: '−',
+      build: (n, o) => ({ lhs: L(n[0], ZERO), rhs: L(n[1], rMul(n[1], signed(o[0], n[2]))) }),
+      toT: (x, p) => x - p.d / 60 },
+    { label: '만나는 지점까지의 거리', short: 'x = 만나는 지점까지의 거리(km)', relSet: 1,
+      frame: ['x', '/', { num: 0 }, { op: 0 }, 'x', '/', { num: 1 }, '=', { num: 2 }],
+      roles: ['v1', 'v2', 'delay'], op: '−',
+      build: (n, o) => ({ lhs: L(rAdd(rDiv(ONE, n[0]), signed(o[0], rDiv(ONE, n[1]))), ZERO), rhs: L(ZERO, n[2]) }),
+      toT: (x, p) => x / p.v2 },
+    { label: '병원까지의 거리', invalid: '그건 이미 알고 있는 값이야. 아직 모르는 것을 x로 놓아야 해.' },
+  ],
+  relSets: [
+    [ { t: '두 대가 움직인 시간이 같다', why: (p) => `구급차가 ${p.d}분 먼저 출발했어. 만날 때까지 걸린 시간이 같을 수 있을까?` },
+      { t: '두 대가 간 거리가 같다', ok: true },
+      { t: (p) => `두 대가 간 거리의 합이 ${p.h} km다`, why: () => '둘은 같은 방향으로 가고 있어. 거리를 합칠 이유가 있을까?' } ],
+    [ { t: '걸린 시간이 같다', why: (p) => `구급차가 ${p.d}분 먼저 출발했어. 같은 지점까지 걸린 시간이 같을까?` },
+      { t: (p) => `두 대가 간 거리의 합이 ${p.h} km다`, why: () => '둘은 같은 방향으로 가고 있어. 거리를 합칠 이유가 있을까?' },
+      { t: (p) => `걸린 시간의 차가 ${p.d}분이다`, ok: true } ],
+  ],
+  // 대표 오답 (함정 도감)
+  traps: {
+    minutes: { name: '분을 그대로 넣기', why: '속력이 시속이면 시간도 시간 단위여야 한다.',
+      hint: (p) => `속력이 시속이야. ${p.d}분은 몇 시간이지?`, maru: '어… 드론이 몇 시간이나 날아가는데요?' },
+    wrongconv: { name: '거꾸로 변환하기', why: '분을 시간으로 바꾸려면 60으로 나눈다.',
+      hint: (p) => `${p.d}분에 60을 곱하면 초가 돼. 시간으로 바꾸려면 어떻게 해야 하지?`, maru: '숫자가 엄청 커졌어요!' },
+    reversed: { name: '시간 관계를 거꾸로', why: '먼저 출발한 쪽이 더 오래 움직였다.',
+      hint: () => '먼저 출발한 쪽이 더 오래 달렸어. 구급차의 시간은 드론보다 길까, 짧을까?', maru: '시간이… 음수가 나와요?' },
+    swapped: { name: '속력을 바꿔 넣기', why: '어느 쪽의 속력인지 짝을 맞춰야 한다.',
+      hint: () => '어느 쪽이 먼저 출발했고, 그쪽 속력은 얼마지?', maru: '드론이랑 구급차가 뒤바뀐 것 같아요.' },
+    extra: { name: '필요 없는 값 넣기', why: '문제에 나온 수가 모두 식에 필요한 것은 아니다.',
+      hint: (p) => `${p.h} km는 무엇의 거리지? 지금 식에 필요한 값일까?`, maru: '그 숫자, 병원 거리 아니에요?' },
   },
-  celebrate: (p, xr) => {
-    const x = rNum(xr);
-    return `준호가 ${fmtTime(x)}(x = ${rFmt(xr)}시간) 만에 ${fmtKm(p.v2 * x)} 지점에서 민지를 따라잡았어요.`;
-  },
+  positionsAt: (p, t) => ({ target: p.v1 * (t + p.d / 60), unit: p.v2 * t }),
 };
-
-// ---- STAGES ----
+const TRAP_IDS = Object.keys(MISSION.traps);
 const STAGES = [
-  { id: '1-1', type: CATCH_UP, kind: '조립', label: '식 틀에 알맞은 카드를 놓아요',
-    paramSets: [{ v1: 3, d: 20, v2: 9 }] },
-  { id: '1-2', type: CATCH_UP, kind: '오답 탐정', label: '누군가 세운 식이에요. 재생해 보고 틀린 카드를 바꿔요',
-    paramSets: [{ v1: 4, d: 15, v2: 6 }], prefill: ['minutes'] },
-  { id: '1-3', type: CATCH_UP, kind: '조건 바꾸기', label: '숫자가 바뀌었어요. 같은 구조로 식을 세워요',
-    paramSets: [{ v1: 4, d: 30, v2: 12 }, { v1: 3, d: 30, v2: 6 }, { v1: 5, d: 12, v2: 15 }] },
+  { key: 'train', name: '훈련', desc: '팀장의 안내를 받으며 식 세우기' },
+  { key: 'live', name: '실전', desc: '바뀐 숫자, 마루의 식 검증하기' },
+  { key: 'twist', name: '돌발', desc: '맞바람 — 답이 상황에 맞는지 판단' },
 ];
-const LOCKED_TYPES = ['유형 2 · 호수 둘레', '유형 3 · 왕복', '유형 4 · 기차와 터널'];
+const INTRO = [
+  ['sys', '밤 11시 40분. 모아시 전역에 대정전이 일어났다.'],
+  ['lead', '수습, 첫 근무부터 큰일이군. 나는 한솔 팀장이다.'],
+  ['lead', '예측 시스템이 전부 꺼졌어. 이제 미래는 우리가 직접 계산해야 해. 식을 세워서.'],
+  ['maru', '안녕하세요, 보조 AI 마루예요! 기억 장치가 좀… 깨졌지만 도울게요!'],
+  ['lead', '마루의 말은 꼭 검증하고 써. 첫 호출이 들어왔다. 지도를 열어.'],
+];
+const WHO = { lead: { name: '한솔 팀장', color: C.amber }, maru: { name: '마루', color: C.unit }, sys: { name: '', color: C.dim } };
+
+// ---- 저장 ----
+function loadSave() {
+  const base = { grades: {}, codex: [], maru: 0, seenIntro: false, muted: false };
+  try { return Object.assign(base, JSON.parse(localStorage.getItem(CONFIG.storageKey)) || {}); } catch { return base; }
+}
+function persist() { try { localStorage.setItem(CONFIG.storageKey, JSON.stringify(state.save)); } catch {} }
 
 // ---- state ----
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-let W = 0, H = 0, K = 1;            // 논리 크기와 축소 배율
+let W = 0, H = 0, K = 1;
 const state = {
-  scene: 'title',                   // title | map | stage | playing | result
-  time: 0, score: 0,                // score = 모은 별 합계
-  stars: {},                        // { '1-1': 3, ... }
-  mapSel: 0, muted: false, hidden: false,
-  stageIndex: -1, stage: null,      // stage = 현재 스테이지 인스턴스
-  play: null, result: null, shake: 0, particles: [],
-  lastParams: {},                   // 조건 바꾸기에서 직전 숫자 묶음 기억
-  buttons: [], drag: null,
+  scene: 'title',     // title | intro | city | call | brief1 | brief2 | build | sim | exec | judge | debrief | codex
+  time: 0, score: 0,  // score = 계급 점수
+  save: loadSave(),
+  citySel: 0, hidden: false,
+  m: null,            // 진행 중인 미션 단계
+  dialog: null, anim: null, hold: null, drag: null,
+  shake: 0, lock: 0, particles: [], buttons: [], slotRects: [], lastParams: {},
+  lightUp: 0,
 };
+const gradeKey = (stage) => `${MISSION.id}-${stage}`;
+const stageUnlocked = (i) => i === 0 || !!state.save.grades[gradeKey(STAGES[i - 1].key)];
+const stagesDone = () => STAGES.filter((s) => state.save.grades[gradeKey(s.key)]).length;
+function recalcScore() { state.score = Object.values(state.save.grades).reduce((a, g) => a + CONFIG.rankPoints[g], 0); }
+function rankName() {
+  const s = state.score;
+  return s >= CONFIG.rankChief ? '수석 관제사' : s >= CONFIG.rankSenior ? '선임 관제사' : s >= CONFIG.rankOperator ? '관제사' : '수습 관제사';
+}
+recalcScore();
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -157,154 +200,297 @@ function resize() {
 window.addEventListener('resize', resize);
 window.visualViewport?.addEventListener('resize', resize);
 
-// ---- 스테이지 진행 ----
-function openStage(index) {
-  const def = STAGES[index];
-  let pi = Math.floor(Math.random() * def.paramSets.length);
-  if (def.paramSets.length > 1 && pi === state.lastParams[def.id]) pi = (pi + 1) % def.paramSets.length;
-  state.lastParams[def.id] = pi;
-  const p = def.paramSets[pi], t = def.type;
-  const frame = t.frame(p);
-  const slotCount = frame.filter((tok) => typeof tok === 'object').length;
-  const cards = t.cards(p).map((c) => ({ ...c, where: 'hand', x: W / 2, y: H, w: 0, h: CONFIG.cardMinSize, tx: 0, ty: 0 }));
-  const slots = new Array(slotCount).fill(null);
-  (def.prefill || []).forEach((id, i) => { slots[i] = id; cards.find((c) => c.id === id).where = i; });
-  const answer = t.answer(p);
-  state.stageIndex = index;
-  state.stage = { def, type: t, p, frame, cards, slots, attempts: 0, sceneT: 0, answer, maxKm: niceMax(t.positionsAt(p, rNum(answer)).b * CONFIG.trackMargin), finalGap: false };
-  state.play = null; state.result = null; state.scene = 'stage';
+// ---- 대사 ----
+function say(lines, onDone) {
+  state.dialog = { lines: lines.map(([who, text]) => ({ who, text })), i: 0, chars: 0, onDone };
+  sfx.play('radio');
 }
-function niceMax(v) { const steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]; return steps.find((s) => s >= v) || Math.ceil(v); }
-const card = (id) => state.stage.cards.find((c) => c.id === id);
-const slotsFull = () => state.stage.slots.every((s) => s !== null);
+function advanceDialog(skipAll) {
+  const d = state.dialog; if (!d) return;
+  const cur = d.lines[d.i];
+  if (!skipAll && d.chars < cur.text.length) { d.chars = cur.text.length; return; }
+  if (!skipAll && d.i + 1 < d.lines.length) { d.i++; d.chars = 0; sfx.play('radio'); return; }
+  state.dialog = null;
+  if (d.onDone) d.onDone();
+}
+
+// ---- 미션 진행 ----
+function startStage(key) {
+  const sets = MISSION.paramSets[key];
+  let pi = Math.floor(Math.random() * sets.length);
+  if (sets.length > 1 && pi === state.lastParams[key]) pi = (pi + 1) % sets.length;
+  state.lastParams[key] = pi;
+  const p = sets[pi];
+  state.m = {
+    stage: key, p, unknown: null, relOK: false,
+    cards: MISSION.cards(p).map((c) => ({ ...c, val: c.base, conv: null, where: 'hand', x: W / 2, y: H + 60, w: 80, h: 60, tx: W / 2, ty: H + 60, tw: 80, th: 60 })),
+    nums: [], ops: [], sims: 0, approvals: 0, helped: false, newCodex: [], maruPiece: false,
+    sceneT: 0, ghost: true, readout: null, convMode: false, convSel: null, direct: false, judge: null,
+  };
+  state.anim = null; state.scene = 'call';
+  say(MISSION.call[key](p), () => {
+    if (key === 'live') maruProposal(); else state.scene = 'brief1';
+  });
+  sfx.play('alarm');
+}
+const U = () => MISSION.unknowns[state.m.unknown];
+const card = (id) => state.m.cards.find((c) => c.id === id);
+const slotsFull = () => state.m.nums.length > 0 && state.m.nums.every((s) => s !== null) && state.m.ops.every((o) => o !== null);
+
+function chooseUnknown(i) {
+  const m = state.m, u = MISSION.unknowns[i];
+  if (!u || (state.scene !== 'brief1')) return;
+  if (u.invalid) { say([['lead', u.invalid]]); return; }
+  setUnknown(i);
+  state.scene = 'brief2'; sfx.play('place');
+}
+function setUnknown(i) {
+  const m = state.m, u = MISSION.unknowns[i];
+  m.unknown = i; m.relOK = false;
+  m.cards.forEach((c) => { c.where = 'hand'; });
+  m.nums = new Array(u.frame.filter((t) => t.num !== undefined).length).fill(null);
+  m.ops = new Array(u.frame.filter((t) => t.op !== undefined).length).fill(null);
+  m.sceneT = 0; m.readout = null;
+}
+function chooseRelation(i) {
+  const m = state.m; if (state.scene !== 'brief2') return;
+  const rel = MISSION.relSets[U().relSet][i]; if (!rel) return;
+  if (!rel.ok) { if (m.stage !== 'train') m.helped = true; say([['lead', rel.why(m.p)]]); return; }
+  m.relOK = true; state.scene = 'build'; sfx.play('place');
+}
+// 실전: 마루가 식을 먼저 채워 둔다
+function maruProposal() {
+  const m = state.m;
+  setUnknown(0); m.relOK = true;
+  const wrong = Math.random() < CONFIG.maruWrongRate;
+  const kind = wrong ? ['minutes', 'reversed', 'swapped', 'extra'][Math.floor(Math.random() * 4)] : 'ok';
+  m.maruKind = kind;
+  if (kind !== 'minutes' && kind !== 'extra') convert('d', '÷60', true);
+  const fill = { ok: ['v1', 'd', 'v2'], minutes: ['v1', 'd', 'v2'], reversed: ['v1', 'd', 'v2'], swapped: ['v2', 'd', 'v1'], extra: ['v1', 'h', 'v2'] }[kind];
+  fill.forEach((id, i) => { m.nums[i] = id; card(id).where = i; });
+  m.ops[0] = kind === 'reversed' ? '−' : '+';
+  state.scene = 'build';
+}
 
 function placeCard(id, slotIndex) {
-  const st = state.stage, c = card(id);
-  if (!c || state.scene !== 'stage') return;
-  if (slotIndex === undefined) {
-    slotIndex = st.slots.indexOf(null);
-    if (slotIndex < 0) slotIndex = st.slots.length - 1;      // 빈 칸이 없으면 마지막 칸을 바꾼다
-  }
-  if (c.where !== 'hand') st.slots[c.where] = null;
-  const prev = st.slots[slotIndex];
+  const m = state.m, c = card(id);
+  if (!c || state.scene !== 'build') return;
+  if (slotIndex === undefined) { slotIndex = m.nums.indexOf(null); if (slotIndex < 0) slotIndex = m.nums.length - 1; }
+  if (c.where !== 'hand') m.nums[c.where] = null;
+  const prev = m.nums[slotIndex];
   if (prev && prev !== id) card(prev).where = 'hand';
-  st.slots[slotIndex] = id; c.where = slotIndex;
-  st.sceneT = 0; st.finalGap = false;
-  sfx.play('place');
+  m.nums[slotIndex] = id; c.where = slotIndex;
+  m.sceneT = 0; m.readout = null; sfx.play('place');
 }
 function removeCard(id) {
-  const st = state.stage, c = card(id);
-  if (!c || c.where === 'hand' || state.scene !== 'stage') return;
-  st.slots[c.where] = null; c.where = 'hand'; st.sceneT = 0; st.finalGap = false;
-  sfx.play('pick');
+  const m = state.m, c = card(id);
+  if (!c || c.where === 'hand' || state.scene !== 'build') return;
+  m.nums[c.where] = null; c.where = 'hand'; m.sceneT = 0; m.readout = null; sfx.play('pick');
 }
-function resetSlots() {
-  if (state.scene !== 'stage') return;
-  const st = state.stage;
-  st.slots.forEach((id) => { if (id) card(id).where = 'hand'; });
-  st.slots.fill(null); st.sceneT = 0; st.finalGap = false;
+function setOp(i, op) {
+  const m = state.m; if (state.scene !== 'build') return;
+  m.ops[i] = op !== undefined ? op : (m.ops[i] === '+' ? '−' : '+');
+  m.sceneT = 0; m.readout = null; sfx.play('place');
+}
+function convert(id, mode, silent) {
+  const c = card(id); if (!c) return;
+  c.conv = mode || null;
+  c.val = mode === '÷60' ? rDiv(c.base, R(60)) : mode === '×60' ? rMul(c.base, R(60)) : c.base;
+  if (state.m) { state.m.sceneT = 0; state.m.readout = null; }
+  if (!silent) sfx.play('convert');
 }
 
-// 식을 풀어 재생을 시작한다
-function playEquation() {
-  const st = state.stage;
-  if (state.scene !== 'stage' || !slotsFull()) return;
-  const untouched = st.def.prefill && st.def.prefill.every((id, i) => st.slots[i] === id);
-  if (!untouched) st.attempts++;
-  const t = st.type, p = st.p;
-  const linsOf = (ids) => ids.map((id) => t.cards(p).find((c) => c.id === id).lin);
-  const eq = t.build(p, linsOf(st.slots));
-  const isCorrect = st.slots.every((id, i) => id === t.correct[i]);
-  const wrong = t.wrongs(p).find((w) => equivalent(eq, t.build(p, linsOf(w.slots))));
+// 현재 식을 평가한다
+function evaluate() {
+  const m = state.m, u = U(), p = m.p;
+  const vals = m.nums.map((id) => card(id).val);
+  const eq = u.build(vals, m.ops);
+  const want = { v1: R(p.v1), v2: R(p.v2), delay: R(p.d, 60) };
+  const correctEq = u.build(u.roles.map((r) => want[r]), [u.op]);
   const sol = solve(eq);
-  const outcome = { isCorrect, wrong, sol };
-  if (sol.kind !== 'unique' || rNum(sol.x) < 0) { finishPlay(outcome); return; }   // 재생할 수 없는 해
-  const x = rNum(sol.x), xc = rNum(st.answer);
-  const overshoot = x > xc * CONFIG.overshootFactor;
-  const dur = overshoot ? CONFIG.playDurationMax : CONFIG.playDuration * Math.min(CONFIG.playScaleMax, Math.max(CONFIG.playScaleMin, x / xc));
-  state.play = { t: 0, dur, x, hold: CONFIG.resultHold, outcome };
-  state.scene = 'playing';
-  sfx.play('start');
-}
-function skipPlay() { if (state.scene === 'playing') { state.play.t = state.play.dur; state.play.hold = 0; } }
-
-function finishPlay(outcome) {
-  const st = state.stage, t = st.type, p = st.p, { sol, isCorrect, wrong } = outcome;
-  const res = { kind: '', title: '', lines: [], hint: '', stars: 0 };
-  if (isCorrect) {
-    res.kind = 'correct'; res.title = '딱 맞았어요!';
-    res.lines = [t.celebrate(p, sol.x)];
-    res.stars = st.attempts === 1 ? CONFIG.starsFirstTry : st.attempts === 2 ? CONFIG.starsSecondTry : CONFIG.starsLater;
-    state.stars[st.def.id] = Math.max(state.stars[st.def.id] || 0, res.stars);
-    state.score = Object.values(state.stars).reduce((a, b) => a + b, 0);
-    st.sceneT = rNum(sol.x);
-    burst(); sfx.play('correct');
-  } else {
-    state.shake = CONFIG.shakeOnMismatch; sfx.play('mismatch');
-    if (sol.kind !== 'unique') {
-      res.kind = 'undetermined'; res.title = 'x가 정해지지 않아요';
-      res.lines = [sol.kind === 'none' ? '이 식을 만족하는 x가 없어요.' : '어떤 x를 넣어도 성립하는 식이에요.'];
-    } else if (rNum(sol.x) < 0) {
-      res.kind = 'negative'; res.title = '출발할 수 없어요';
-      res.lines = [`식을 풀면 x = ${rFmt(sol.x)}이에요. 달린 시간이 음수일 수는 없어요.`];
-    } else {
-      res.kind = 'mismatch'; res.title = '어긋났어요';
-      res.lines = [`식을 풀면 x = ${rFmt(sol.x)}이에요.`, t.describe(p, rNum(sol.x))];
-      st.sceneT = rNum(sol.x); st.finalGap = true;
-    }
-    res.hint = wrong ? wrong.hint : '문제의 조건을 장면과 하나씩 맞춰 보세요.';
+  const res = { correct: equivalent(eq, correctEq), sol, trap: null, t: null, kind: 'mismatch' };
+  if (!res.correct) {
+    const by = {}; u.roles.forEach((r, i) => { by[r] = vals[i]; });
+    if (vals.some((v) => rEq(v, R(p.h)))) res.trap = 'extra';
+    else if (rEq(by.v1, R(p.v2)) && rEq(by.v2, R(p.v1))) res.trap = 'swapped';
+    else if (rEq(by.delay, R(p.d))) res.trap = 'minutes';
+    else if (rEq(by.delay, R(p.d * 60))) res.trap = 'wrongconv';
+    else if (m.ops[0] !== u.op) res.trap = 'reversed';
   }
-  state.play = null; state.result = res; state.scene = 'result';
+  if (sol.kind !== 'unique') res.kind = 'undetermined';
+  else {
+    res.t = u.toT(rNum(sol.x), p);
+    if (rNum(sol.x) < 0 || res.t < 0) res.kind = 'negative';
+    else if (res.correct) res.kind = 'correct';
+  }
+  return res;
+}
+function readoutFor(res) {
+  const m = state.m, p = m.p;
+  if (res.kind === 'undetermined') return ['식을 풀 수 없어요.', 'x가 정해지지 않아요.'];
+  if (res.kind === 'negative') return [`식을 풀면 x = ${rFmt(res.sol.x)}.`, '드론이 출발도 하기 전의 시간이 나와요.'];
+  const pos = MISSION.positionsAt(p, res.t), gap = Math.abs(pos.unit - pos.target);
+  const tail = gap < 1e-9 ? '두 대가 같은 위치!' : pos.unit > pos.target ? `드론이 ${fmtKm(gap)} 지나쳤어요.` : `구급차가 아직 ${fmtKm(gap)} 앞에 있어요.`;
+  return [`x = ${rFmt(res.sol.x)} → 드론 ${fmtTime(res.t)} 비행`, `드론 ${fmtKm(pos.unit)} · 구급차 ${fmtKm(pos.target)} 지점`, tail];
+}
+function trueT() { const p = state.m.p; return (p.v1 * p.d / 60) / (p.v2 - p.v1); }
+function startAnim(mode, res, onEnd, targetT) {
+  const tt = trueT(), x = targetT ?? res.t;
+  const overshoot = x > tt * CONFIG.overshootFactor;
+  const base = mode === 'sim' ? CONFIG.simDuration : CONFIG.playDuration;
+  const dur = overshoot ? Math.min(CONFIG.playDurationMax, base * 1.5) : base * Math.min(CONFIG.playScaleMax, Math.max(CONFIG.playScaleMin, x / tt));
+  state.m.ghost = mode === 'sim';
+  state.anim = { t: 0, dur, x, hold: mode === 'sim' ? 0.15 : CONFIG.resultHold, onEnd };
+  state.scene = mode;
+}
+function registerTrap(id) {
+  if (!id || state.save.codex.includes(id)) return false;
+  state.save.codex.push(id); state.m.newCodex.push(id); persist(); sfx.play('codex');
+  return true;
 }
 
-function resultAction() {
-  if (state.scene !== 'result') return;
-  if (state.result.kind === 'correct') {
-    if (state.stageIndex + 1 < STAGES.length) openStage(state.stageIndex + 1);
-    else { state.scene = 'map'; state.mapSel = 0; }
-  } else { state.result = null; state.scene = 'stage'; state.stage.sceneT = 0; state.stage.finalGap = false; }
+function simulate() {
+  const m = state.m;
+  if (state.scene !== 'build' || !slotsFull()) return;
+  m.sims++;
+  const res = evaluate();
+  const done = () => {
+    state.scene = 'build'; m.readout = { lines: readoutFor(res), kind: res.kind };
+    if (res.kind !== 'correct' && res.kind !== 'mismatch') state.shake = CONFIG.shakeOnMismatch;
+    if (registerTrap(res.trap)) {
+      const t = MISSION.traps[res.trap];
+      say([['maru', t.maru], ['sys', `함정 도감에 등록: 「${t.name}」`]]);
+    }
+  };
+  sfx.play('sim');
+  if (res.kind === 'undetermined' || res.kind === 'negative') { m.sceneT = 0; done(); return; }
+  startAnim('sim', res, done);
+}
+
+function approve() {
+  const m = state.m;
+  if (state.scene !== 'build' || !slotsFull()) return;
+  const res = evaluate();
+  sfx.play('approve');
+  if (!res.correct) { m.approvals++; registerTrap(res.trap); safetyLock(res.trap ? MISSION.traps[res.trap].hint(m.p) : '문제의 조건을 장면과 하나씩 맞춰 봐. 무엇이 같아져야 하지?'); return; }
+  if (m.stage === 'twist') {                         // 해가 상황에 맞는지 판단
+    const meet = MISSION.positionsAt(m.p, res.t).unit;
+    m.judge = { meet, res };
+    m.readout = { lines: readoutFor(res), kind: 'correct' }; m.sceneT = res.t; m.ghost = true;
+    state.scene = 'judge';
+    return;
+  }
+  m.approvals++;
+  startAnim('exec', res, () => missionSuccess(`전달 완료. ${fmtKm(MISSION.positionsAt(m.p, res.t).unit)} 지점에서 혈청을 넘겼다. 잘했어.`));
+}
+function chooseJudge(i) {
+  const m = state.m; if (state.scene !== 'judge') return;
+  m.approvals++;
+  if (i === 0) {                                     // 길 위에서 전달 — 병원보다 먼 지점이라 불가능
+    state.scene = 'build';
+    safetyLock(`구급차는 ${m.p.h} km 지점의 병원에서 멈춰. ${fmtKm(m.judge.meet)} 지점에는 아무도 없어.`);
+    return;
+  }
+  m.direct = true;
+  startAnim('exec', m.judge.res, () => missionSuccess('좋은 판단이야. 답을 구한 뒤에 상황에 맞는지 확인하는 것, 그게 관제사의 일이다.'), m.p.h / m.p.v2);
+}
+function safetyLock(hint) {
+  state.lock = 1; state.shake = CONFIG.shakeOnMismatch; sfx.play('lock');
+  say([['sys', '안전 잠금 작동 — 작전이 중단되었습니다.'], ['lead', hint]]);
+}
+function missionSuccess(line) {
+  const m = state.m;
+  burst(); sfx.play('success');
+  const first = m.approvals === 1;
+  const grade = first && !m.helped ? 'S' : first || (m.approvals === 2 && !m.helped) ? 'A' : m.approvals <= 3 ? 'B' : 'C';
+  const key = gradeKey(m.stage), prev = state.save.grades[key];
+  const newlyDone = !prev;
+  if (!prev || CONFIG.rankPoints[grade] > CONFIG.rankPoints[prev]) state.save.grades[key] = grade;
+  if (m.stage === 'live' && first) { state.save.maru++; m.maruPiece = true; }
+  persist(); recalcScore();
+  m.result = { grade, newlyDone };
+  const lines = [['lead', line]];
+  if (m.stage === 'live') lines.push(['maru', m.maruKind === 'ok' ? '제 식이 맞았죠? 기억이 조금 돌아온 것 같아요!' : '제 식이 틀렸었군요… 고쳐 주셔서 고마워요. 하나 배웠어요!']);
+  say(lines, () => { state.scene = 'debrief'; if (newlyDone) { state.lightUp = CONFIG.lightUpDuration; sfx.play('light'); } });
+}
+function askLead() {
+  const m = state.m; if (state.scene !== 'build') return;
+  m.helped = true;
+  let hint = U().relSet === 1 ? '시간은 거리 ÷ 속력이야. 각자 걸린 시간을 x로 써 봐.' : '각자 간 거리를 속력 × 시간으로 써 봐. 누가 더 오래 움직였지?';
+  if (slotsFull()) { const res = evaluate(); hint = res.correct ? '내가 보기엔 빈틈이 없어. 모의 실행으로 확인해 봐.' : res.trap ? MISSION.traps[res.trap].hint(m.p) : hint; }
+  say([['lead', hint]]);
+}
+function nextAfterDebrief() {
+  const i = STAGES.findIndex((s) => s.key === state.m.stage);
+  if (i + 1 < STAGES.length) startStage(STAGES[i + 1].key);
+  else { state.scene = 'city'; state.citySel = 0; }
 }
 function goBack() {
-  if (state.scene === 'map') state.scene = 'title';
-  else if (state.scene !== 'title') { state.scene = 'map'; state.mapSel = Math.max(0, state.stageIndex); state.play = null; state.result = null; }
+  if (state.dialog) return;
+  if (state.scene === 'city') state.scene = 'title';
+  else if (state.scene === 'codex') state.scene = 'city';
+  else if (state.scene === 'brief2') state.scene = 'brief1';
+  else if (state.scene === 'build' && state.m.stage !== 'live') state.scene = 'brief2';
+  else if (state.scene !== 'title' && state.scene !== 'intro') { state.scene = 'city'; state.anim = null; }
 }
 function primaryAction() {
   sfx.unlock();
-  if (state.scene === 'title') state.scene = 'map';
-  else if (state.scene === 'map') openStage(state.mapSel);
-  else if (state.scene === 'stage') playEquation();
-  else if (state.scene === 'playing') skipPlay();
-  else if (state.scene === 'result') resultAction();
+  if (state.dialog) { advanceDialog(); return; }
+  if (state.scene === 'title') {
+    if (state.save.seenIntro) state.scene = 'city';
+    else { state.scene = 'intro'; say(INTRO, () => { state.save.seenIntro = true; persist(); state.scene = 'city'; }); }
+  } else if (state.scene === 'city') { if (stageUnlocked(state.citySel)) startStage(STAGES[state.citySel].key); }
+  else if (state.scene === 'build') simulate();
+  else if (state.scene === 'sim' || state.scene === 'exec') { state.anim.t = state.anim.dur; state.anim.hold = 0; }
+  else if (state.scene === 'debrief') nextAfterDebrief();
 }
 
-// ---- input: 키보드 + 포인터(터치) ----
+// ---- input ----
 window.addEventListener('keydown', (e) => {
   const k = e.key;
-  if (e.repeat && (k === 'Enter' || k === ' ')) { e.preventDefault(); return; }
-  if (k === 'Enter' || k === ' ') { e.preventDefault(); primaryAction(); }
-  else if (k === 'Escape') goBack();
-  else if (k === 'm' || k === 'M') state.muted = !state.muted;
-  else if (state.scene === 'map' && (k === 'ArrowRight' || k === 'ArrowDown')) state.mapSel = (state.mapSel + 1) % STAGES.length;
-  else if (state.scene === 'map' && (k === 'ArrowLeft' || k === 'ArrowUp')) state.mapSel = (state.mapSel + STAGES.length - 1) % STAGES.length;
-  else if (state.scene === 'stage') {
-    if (k === 'r' || k === 'R') resetSlots();
-    else if (k === 'Backspace') { const filled = state.stage.slots.filter(Boolean); if (filled.length) removeCard(filled[filled.length - 1]); }
-    else if (/^[1-9]$/.test(k)) { const hand = state.stage.cards.filter((c) => c.where === 'hand'); const c = hand[Number(k) - 1]; if (c) placeCard(c.id); }
+  if (k === 'Enter' || k === ' ') {
+    e.preventDefault(); if (e.repeat) return;
+    if (k === 'Enter' && e.shiftKey && state.scene === 'build' && !state.dialog) approve(); else primaryAction();
+    return;
+  }
+  if (k === 'm' || k === 'M') { state.save.muted = !state.save.muted; persist(); return; }
+  if (state.dialog) { if (k === 's' || k === 'S') advanceDialog(true); return; }
+  if (k === 'Escape') goBack();
+  else if (state.scene === 'city' && (k === 'ArrowDown' || k === 'ArrowRight')) state.citySel = (state.citySel + 1) % STAGES.length;
+  else if (state.scene === 'city' && (k === 'ArrowUp' || k === 'ArrowLeft')) state.citySel = (state.citySel + STAGES.length - 1) % STAGES.length;
+  else if (/^[1-9]$/.test(k)) {
+    const n = Number(k) - 1;
+    if (state.scene === 'brief1') chooseUnknown(n);
+    else if (state.scene === 'brief2') chooseRelation(n);
+    else if (state.scene === 'judge') chooseJudge(n);
+    else if (state.scene === 'build') { const c = state.m.cards.filter((cd) => cd.where === 'hand')[n]; if (c) placeCard(c.id); }
+  } else if (state.scene === 'build') {
+    if (k === 'Backspace') { const filled = state.m.nums.filter(Boolean); if (filled.length) removeCard(filled[filled.length - 1]); }
+    else if (k === 'h' || k === 'H') askLead();
+    else if (k === '+' || k === '-') setOp(0, k === '+' ? '+' : '−');
   }
 });
 const pt = (e) => { const b = canvas.getBoundingClientRect(); return { x: (e.clientX - b.left) / K, y: (e.clientY - b.top) / K }; };
 const inRect = (p, r, pad = 0) => p.x >= r.x - pad && p.x <= r.x + r.w + pad && p.y >= r.y - pad && p.y <= r.y + r.h + pad;
-
 canvas.addEventListener('pointerdown', (e) => {
   sfx.unlock();
   const p = pt(e);
-  if (state.scene === 'stage') {
-    const c = [...state.stage.cards].reverse().find((cd) => inRect(p, cd));
-    if (c) { state.drag = { id: c.id, sx: p.x, sy: p.y, ox: p.x - c.x, oy: p.y - c.y, moved: false }; try { canvas.setPointerCapture(e.pointerId); } catch {} return; }
+  if (state.dialog) {
+    const skip = state.buttons.find((b) => b.id === 'skip' && inRect(p, b));
+    advanceDialog(!!skip); return;
+  }
+  if (state.scene === 'build') {
+    const c = [...state.m.cards].reverse().find((cd) => inRect(p, cd));
+    if (c) {
+      if (state.m.convMode && c.where === 'hand') { state.m.convSel = c.id; sfx.play('pick'); return; }
+      state.drag = { id: c.id, sx: p.x, sy: p.y, ox: p.x - c.x, oy: p.y - c.y, moved: false };
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+      return;
+    }
   }
   const b = [...state.buttons].reverse().find((bt) => inRect(p, bt));
-  if (b) b.onTap();
-  else if (state.scene === 'title' || state.scene === 'playing') primaryAction();
+  if (b) { if (b.hold) state.hold = { id: b.id, t: 0, onDone: b.onTap }; else b.onTap(); }
+  else if (state.scene === 'title' || state.scene === 'sim' || state.scene === 'exec') primaryAction();
 });
 canvas.addEventListener('pointermove', (e) => {
   const d = state.drag; if (!d) return;
@@ -312,19 +498,19 @@ canvas.addEventListener('pointermove', (e) => {
   if (!d.moved && Math.hypot(p.x - d.sx, p.y - d.sy) > CONFIG.dragThreshold) { d.moved = true; sfx.play('pick'); }
   if (d.moved) { c.x = p.x - d.ox; c.y = p.y - d.oy; }
 });
-function endDrag(e) {
+canvas.addEventListener('pointerup', (e) => {
+  state.hold = null;
   const d = state.drag; if (!d) return;
   state.drag = null;
   const c = card(d.id), p = pt(e);
   if (!d.moved) { if (c.where === 'hand') placeCard(c.id); else removeCard(c.id); return; }
-  const si = (state.slotRects || []).findIndex((r) => inRect(p, r, CONFIG.dropPadding));
+  const si = state.slotRects.findIndex((r) => r && inRect(p, r, CONFIG.dropPadding));
   if (si >= 0) placeCard(c.id, si); else if (c.where !== 'hand') removeCard(c.id);
-}
-canvas.addEventListener('pointerup', endDrag);
-canvas.addEventListener('pointercancel', () => { state.drag = null; });   // 취소되면 카드는 원래 자리로 돌아간다
+});
+canvas.addEventListener('pointercancel', () => { state.drag = null; state.hold = null; });
 document.addEventListener('visibilitychange', () => { state.hidden = document.hidden; });
 
-// ---- sfx: WebAudio 합성 ----
+// ---- sfx ----
 const sfx = {
   ac: null,
   unlock() { if (!this.ac) { try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch {} } this.ac?.resume?.(); },
@@ -335,13 +521,20 @@ const sfx = {
     o.connect(g).connect(this.ac.destination); o.start(t); o.stop(t + dur);
   },
   play(name) {
-    if (state.muted || !this.ac) return;
+    if (state.save.muted || !this.ac) return;
     const j = 1 + (Math.random() - 0.5) * 0.1;
+    const seq = (fs, step, dur, type, vol) => fs.forEach((f, i) => this.tone(f, f, dur, type, i * step, vol));
     if (name === 'pick') this.tone(520 * j, 620 * j, 0.06, 'triangle');
     else if (name === 'place') this.tone(440 * j, 330 * j, 0.08, 'triangle');
-    else if (name === 'start') this.tone(330, 660, 0.18, 'sine');
-    else if (name === 'mismatch') this.tone(220, 160, 0.22, 'sawtooth', 0, 0.5);
-    else if (name === 'correct') [523, 659, 784].forEach((f, i) => this.tone(f, f, 0.16, 'sine', i * 0.13));
+    else if (name === 'convert') this.tone(400, 800, 0.12, 'sine');
+    else if (name === 'sim') this.tone(300, 450, 0.16, 'sine');
+    else if (name === 'approve') seq([392, 587], 0.14, 0.16, 'sine', 1);
+    else if (name === 'lock') this.tone(180, 120, 0.3, 'sawtooth', 0, 0.5);
+    else if (name === 'success') seq([523, 659, 784], 0.13, 0.16, 'sine', 1);
+    else if (name === 'light') seq([392, 494, 587, 784], 0.2, 0.26, 'triangle', 0.8);
+    else if (name === 'codex') this.tone(880, 1320, 0.12, 'square', 0, 0.35);
+    else if (name === 'alarm') seq([660, 520, 660, 520], 0.1, 0.09, 'square', 0.3);
+    else if (name === 'radio') this.tone(1800 * j, 900, 0.05, 'square', 0, 0.15);
   },
 };
 
@@ -351,28 +544,31 @@ function burst() {
   for (let i = 0; i < CONFIG.celebrateParticles; i++) {
     const a = Math.random() * Math.PI * 2, s = 80 + Math.random() * 220;
     state.particles.push({ x: sc.x + sc.w / 2, y: sc.y + sc.h / 2, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 120, life: 0.9 + Math.random() * 0.5,
-      color: [C.accent, C.good, C.actorA, C.actorB][i % 4] });
+      color: [C.amber, C.good, C.unit, C.target][i % 4] });
   }
 }
 function update(dt) {
   if (state.hidden) return;
   state.time += dt;
   if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 24);
+  if (state.lock > 0) state.lock = Math.max(0, state.lock - dt * 1.2);
+  if (state.lightUp > 0) state.lightUp = Math.max(0, state.lightUp - dt);
   for (const q of state.particles) { q.life -= dt; q.vy += 520 * dt; q.x += q.vx * dt; q.y += q.vy * dt; }
   state.particles = state.particles.filter((q) => q.life > 0);
-
-  if (state.scene === 'playing') {
-    const pl = state.play;
-    pl.t = Math.min(pl.dur, pl.t + dt);
-    const u = pl.t / pl.dur, ease = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
-    state.stage.sceneT = ease * pl.x;
-    if (pl.t >= pl.dur) { pl.hold -= dt; if (pl.hold <= 0) finishPlay(pl.outcome); }
+  if (state.dialog) { state.dialog.chars += dt * CONFIG.dialogCharsPerSec; return; }
+  if (state.hold) { state.hold.t += dt; if (state.hold.t >= CONFIG.approveHold) { const h = state.hold; state.hold = null; h.onDone(); } }
+  if (state.anim) {
+    const a = state.anim;
+    a.t = Math.min(a.dur, a.t + dt);
+    const u = a.t / a.dur, ease = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    state.m.sceneT = ease * a.x;
+    if (a.t >= a.dur) { a.hold -= dt; if (a.hold <= 0) { state.anim = null; a.onEnd(); } }
   }
-  if (state.stage) {
+  if (state.m) {
     const f = Math.min(1, dt / CONFIG.cardSnapTime);
-    for (const c of state.stage.cards) {
+    for (const c of state.m.cards) {
       if (state.drag && state.drag.id === c.id && state.drag.moved) continue;
-      c.x += (c.tx - c.x) * f; c.y += (c.ty - c.y) * f;
+      c.x += (c.tx - c.x) * f; c.y += (c.ty - c.y) * f; c.w += (c.tw - c.w) * f; c.h += (c.th - c.h) * f;
     }
   }
 }
@@ -388,267 +584,373 @@ function rr(x, y, w, h, r, fill, stroke, lw = 1.5, dash) {
   if (fill) { ctx.fillStyle = fill; ctx.fill(); }
   if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.setLineDash(dash || []); ctx.stroke(); ctx.setLineDash([]); }
 }
-// [a:..] [b:..] [k:..] 표시가 있는 문장을 단어 단위로 줄바꿈해 그린다. 줄 수를 돌려준다.
-function richText(str, x, y, maxW, size, lineH, draw = true) {
-  const colorOf = { a: C.actorA, b: C.actorB, k: '#9A6A00' };
-  const words = [];
-  str.replace(/\[([abk]):([^\]]+)\]|([^\[]+)/g, (m, key, marked, plain) => {
-    if (marked) words.push({ t: marked.replace(/ /g, ' '), color: colorOf[key], bold: true, glue: true });
-    else plain.split(/(\s+)/).forEach((w) => { if (w) words.push({ t: w, color: C.ink, space: /^\s+$/.test(w) }); });
-  });
-  let cx = x, line = 0;
-  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    setFont(size, w.bold ? 700 : 500);
-    const ww = w.space ? ctx.measureText(' ').width : ctx.measureText(w.t).width;
-    if (w.space) { if (cx > x) cx += ww; continue; }
-    if (cx + ww > x + maxW && cx > x) { cx = x; line++; }
-    if (draw) { ctx.fillStyle = w.color; ctx.fillText(w.t, cx, y + line * lineH + lineH / 2); }
-    cx += ww;
-  }
-  return line + 1;
-}
-function wrapPlain(str, maxW, size, weight = 500) {
+function wrap(str, maxW, size, weight = 500) {
   setFont(size, weight);
   const out = []; let cur = '';
-  for (const w of str.split(' ')) {
+  for (const w of String(str).split(' ')) {
     const next = cur ? cur + ' ' + w : w;
     if (ctx.measureText(next).width > maxW && cur) { out.push(cur); cur = w; } else cur = next;
   }
   if (cur) out.push(cur);
   return out;
 }
-function button(id, x, y, w, h, label, onTap, opt = {}) {
-  const on = opt.enabled !== false;
-  rr(x, y, w, h, opt.radius ?? 12, opt.fill ?? (on ? C.ink : C.line), opt.stroke);
-  text(label, x + w / 2, y + h / 2 + 1, opt.size ?? 18, opt.color ?? (on ? '#FFFFFF' : C.dim), 'center', 700);
-  if (on) state.buttons.push({ id, x, y, w, h, onTap });
-}
-function stars(n, cx, y, size) {
-  setFont(size, 700); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  for (let i = 0; i < 3; i++) { ctx.fillStyle = i < n ? C.accent : C.line; ctx.fillText('★', cx + (i - 1) * size * 1.1, y); }
+function button(id, x, y, w, h, label, onTap, o = {}) {
+  const on = o.enabled !== false;
+  rr(x, y, w, h, o.radius ?? 12, o.fill ?? (on ? C.unit : C.grid), o.stroke, o.lw);
+  if (o.hold && state.hold && state.hold.id === id) {
+    ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, w, h, o.radius ?? 12); ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillRect(x, y, w * Math.min(1, state.hold.t / CONFIG.approveHold), h); ctx.restore();
+  }
+  text(label, x + w / 2, y + h / 2 + 1, o.size ?? 17, o.color ?? (on ? C.bg : C.dim), 'center', 700);
+  if (on) state.buttons.push({ id, x, y, w, h, onTap, hold: o.hold });
 }
 function column() { const w = Math.min(W, CONFIG.columnMax); return { x: (W - w) / 2 + 16, w: w - 32 }; }
+const str = (t, p) => (typeof t === 'function' ? t(p) : t);
+function topBar(title, back = true) {
+  if (back) button('back', 8, 4, 48, 48, '←', goBack, { fill: 'transparent', color: C.ink, size: 24 });
+  text(title, W / 2, 28, 18, C.ink, 'center', 700);
+  button('mute', W - 56, 4, 48, 48, state.save.muted ? '🔇' : '🔊', () => { state.save.muted = !state.save.muted; persist(); }, { fill: 'transparent', color: C.ink, size: 20 });
+}
+// 무전 아이콘: 팀장(헤드셋) · 마루(둥근 눈)
+function avatar(who, x, y, s) {
+  if (who === 'lead') {
+    ctx.fillStyle = C.amber; ctx.beginPath(); ctx.arc(x, y + 2, s * 0.32, 0, 7); ctx.fill();
+    ctx.strokeStyle = C.amber; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, s * 0.46, Math.PI, 0); ctx.stroke();
+    rr(x - s * 0.56, y - 3, 7, 13, 3, C.amber); rr(x + s * 0.56 - 7, y - 3, 7, 13, 3, C.amber);
+  } else if (who === 'maru') {
+    rr(x - s * 0.48, y - s * 0.4, s * 0.96, s * 0.8, 9, C.panel, C.unit, 2.5);
+    const blink = Math.sin(state.time * 3) > 0.94;
+    ctx.fillStyle = C.unit;
+    ctx.beginPath(); ctx.arc(x - s * 0.2, y, 4.5, 0, 7); ctx.fill();
+    if (blink) ctx.fillRect(x + s * 0.2 - 5, y - 1, 10, 2.5); else { ctx.beginPath(); ctx.arc(x + s * 0.2, y, 4.5, 0, 7); ctx.fill(); }
+  }
+}
+
+// ---- 도시 그림 ----
+const BUILDINGS = (() => {          // 고정된 난수로 건물을 배치한다
+  let seed = 7; const rnd = () => ((seed = (seed * 9301 + 49297) % 233280) / 233280);
+  return Array.from({ length: 46 }, () => ({ x: rnd(), w: 0.03 + rnd() * 0.04, h: 0.25 + rnd() * 0.6, win: Array.from({ length: 6 }, rnd) }));
+})();
+function skyline(x, y, w, h, lit) {   // lit: 0~1, 불 켜진 비율
+  BUILDINGS.forEach((b, i) => {
+    const bx = x + b.x * w, bw = b.w * w, bh = b.h * h;
+    ctx.fillStyle = '#131D31'; ctx.fillRect(bx, y + h - bh, bw, bh);
+    b.win.forEach((r, k) => {
+      const on = (i * 7 + k * 13) % 100 < lit * 100;
+      ctx.fillStyle = on ? C.amber : C.grid; ctx.globalAlpha = on ? 0.9 : 0.6;
+      ctx.fillRect(bx + 3 + (k % 2) * (bw / 2 - 1), y + h - bh + 5 + Math.floor(k / 2) * (bh / 4), 3, 4);
+    });
+    ctx.globalAlpha = 1;
+  });
+}
 
 // ---- render: 화면별 ----
 function renderTitle() {
   const col = column(), cx = W / 2;
-  text(CONFIG.title, cx, H * 0.26, 30, C.ink, 'center', 800);
-  wrapPlain('식을 세우면 장면이 그 식대로 움직여요. 맞는 식은 딱 맞아떨어지고, 틀린 식은 눈에 보이게 어긋나요.', col.w - 24, 17)
-    .forEach((ln, i) => text(ln, cx, H * 0.26 + 52 + i * 26, 17, C.dim, 'center'));
-  // 미니 장면
-  const y = H * 0.52, x0 = col.x + 20, x1 = col.x + col.w - 20, u = (state.time % 3) / 3, e = Math.min(1, u * 1.4);
-  ctx.strokeStyle = C.line; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
-  const meet = x0 + (x1 - x0) * 0.7;
-  ctx.fillStyle = C.actorA; ctx.beginPath(); ctx.arc(x0 + (x1 - x0) * 0.35 + (meet - x0 - (x1 - x0) * 0.35) * e, y - 16, 10, 0, 7); ctx.fill();
-  rr(x0 + (meet - x0) * e - 10, y + 6, 20, 20, 5, C.actorB);
-  button('start', cx - 110, H * 0.68, 220, 56, '시작', primaryAction, { size: 20 });
-  text('Enter 또는 화면 탭', cx, H * 0.68 + 80, 16, C.dim, 'center');
+  skyline(0, H * 0.5, W, H * 0.34, 0.08 + stagesDone() * 0.2);
+  ctx.fillStyle = '#0A111E'; ctx.fillRect(0, H * 0.84, W, H * 0.16);
+  text('관제센터', cx - 22, H * 0.2, 38, C.ink, 'center', 800);
+  text('X', cx + 78, H * 0.2, 46, C.amber, 'center', 800);
+  wrap('대정전의 밤, 식을 세워 도시의 불을 다시 켜라.', col.w - 24, 17).forEach((ln, i) => text(ln, cx, H * 0.2 + 54 + i * 26, 17, C.dim, 'center'));
+  button('start', cx - 110, H * 0.4, 220, 56, state.save.seenIntro ? '근무 이어서' : '근무 시작', primaryAction, { size: 20, fill: C.amber });
+  text('Enter 또는 화면 탭', cx, H * 0.4 + 78, 16, C.dim, 'center');
 }
 
-function renderTopBar(title) {
-  button('back', 8, 4, 48, 48, '←', goBack, { fill: 'transparent', color: C.ink, size: 24 });
-  text(title, W / 2, 28, 18, C.ink, 'center', 700);
-  button('mute', W - 56, 4, 48, 48, state.muted ? '🔇' : '🔊', () => { state.muted = !state.muted; }, { fill: 'transparent', color: C.ink, size: 20 });
-}
-
-function renderMap() {
+function renderCity() {
   const col = column();
-  renderTopBar('스테이지 선택');
-  let y = 68;
-  text('유형 1 · 따라잡기', col.x, y + 12, 20, C.ink, 'left', 800);
-  text(`★ ${state.score} / ${STAGES.length * 3}`, col.x + col.w, y + 12, 16, C.dim, 'right', 700);
-  y += 40;
-  STAGES.forEach((s, i) => {
-    const sel = i === state.mapSel, h = 76;
-    rr(col.x, y, col.w, h, 14, C.stage, sel ? C.ink : C.line, sel ? 2.5 : 1.5);
-    text(s.id, col.x + 18, y + h / 2, 20, C.actorB, 'left', 800);
-    text(s.kind, col.x + 66, y + 26, 18, C.ink, 'left', 700);
-    text(['식 조립하고 재생하기', '틀린 식을 찾아 고치기', '바뀐 숫자로 다시 세우기'][i], col.x + 66, y + 52, 16, C.dim);
-    stars(state.stars[s.id] || 0, col.x + col.w - 52, y + h / 2, 20);
-    state.buttons.push({ id: 'stage' + i, x: col.x, y, w: col.w, h, onTap: () => { state.mapSel = i; openStage(i); } });
-    y += h + 12;
+  topBar('모아시 관제 지도');
+  let y = 58;
+  text(`${rankName()} · ${state.score}점`, col.x, y + 10, 16, C.amber, 'left', 700);
+  text(`마루의 기억 ${state.save.maru}`, col.x + col.w, y + 10, 16, C.unit, 'right', 700);
+  y += 28;
+  // 지도
+  const mh = Math.max(150, Math.min(240, H - y - 372)), map = { x: col.x, y, w: col.w, h: mh };
+  rr(map.x, map.y, map.w, map.h, 14, '#0B1220', C.grid);
+  ctx.save(); ctx.beginPath(); ctx.roundRect(map.x, map.y, map.w, map.h, 14); ctx.clip();
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  for (let gx = map.x + 20; gx < map.x + map.w; gx += 34) { ctx.beginPath(); ctx.moveTo(gx, map.y); ctx.lineTo(gx, map.y + map.h); ctx.stroke(); }
+  for (let gy = map.y + 18; gy < map.y + map.h; gy += 30) { ctx.beginPath(); ctx.moveTo(map.x, gy); ctx.lineTo(map.x + map.w, gy); ctx.stroke(); }
+  const done = stagesDone(), flash = state.lightUp > 0 ? (state.lightUp / CONFIG.lightUpDuration) : 0;
+  skyline(map.x, map.y + map.h * 0.3, map.w, map.h * 0.7, Math.min(1, done / 12 + 0.02));
+  // 교통 구역 도로: 완료할수록 밝아진다
+  ctx.strokeStyle = done ? C.amber : C.dim; ctx.globalAlpha = 0.35 + done * 0.2 + flash * 0.3; ctx.lineWidth = 4 + flash * 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(map.x + 24, map.y + map.h * 0.42); ctx.lineTo(map.x + map.w - 24, map.y + map.h * 0.42); ctx.stroke(); ctx.globalAlpha = 1;
+  const pins = [['혈청 드론', true], ['호수공원', false], ['산악 중계기', false], ['터널', false]];
+  pins.forEach(([name, open], i) => {
+    const px = map.x + map.w * (0.14 + i * 0.24), py = map.y + map.h * 0.42;
+    const pulse = open ? 1 + Math.sin(state.time * 4) * 0.15 : 1;
+    ctx.fillStyle = open ? C.amber : C.grid; ctx.beginPath(); ctx.arc(px, py, 9 * pulse, 0, 7); ctx.fill();
+    ctx.strokeStyle = open ? C.ink : C.dim; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, 9 * pulse, 0, 7); ctx.stroke();
+    text(name, px, py - 22, 13, open ? C.ink : C.dim, 'center', 700);
   });
-  y += 12;
-  LOCKED_TYPES.forEach((name) => {
-    rr(col.x, y, col.w, 52, 14, 'transparent', C.line, 1.5, [6, 5]);
-    text(name, col.x + 18, y + 26, 17, C.dim, 'left', 700);
-    text('준비 중', col.x + col.w - 18, y + 26, 16, C.dim, 'right');
+  ctx.restore();
+  text('교통 구역', map.x + 12, map.y + 16, 14, C.dim, 'left', 700);
+  y += mh + 12;
+  // 미션 패널
+  text(`미션 1 · ${MISSION.name}`, col.x, y + 12, 19, C.ink, 'left', 800);
+  text(MISSION.type, col.x + col.w, y + 12, 15, C.dim, 'right');
+  y += 34;
+  STAGES.forEach((s, i) => {
+    const open = stageUnlocked(i), sel = i === state.citySel, g = state.save.grades[gradeKey(s.key)], h = 64;
+    rr(col.x, y, col.w, h, 12, C.panel, sel ? C.amber : C.grid, sel ? 2.5 : 1.5);
+    text(s.name, col.x + 16, y + 22, 18, open ? C.ink : C.dim, 'left', 700);
+    text(open ? s.desc : '앞 단계를 마치면 열려요', col.x + 16, y + 45, 15, C.dim);
+    if (g) text(g, col.x + col.w - 26, y + h / 2, 28, g === 'S' ? C.amber : C.good, 'center', 800);
+    else if (!open) text('잠김', col.x + col.w - 16, y + h / 2, 15, C.dim, 'right');
+    state.buttons.push({ id: 'stage' + i, x: col.x, y, w: col.w, h, onTap: () => { state.citySel = i; if (open) startStage(s.key); } });
+    y += h + 8;
+  });
+  y += 4;
+  button('codex', col.x, y, col.w, 50, `함정 도감  ${state.save.codex.length} / ${TRAP_IDS.length}`, () => { state.scene = 'codex'; }, { fill: C.panel, stroke: C.unit, color: C.unit });
+  text('미션 2~4와 다른 구역은 준비 중', W / 2, y + 72, 15, C.dim, 'center');
+}
+
+function renderCodex() {
+  const col = column();
+  topBar('함정 도감');
+  let y = 62;
+  text('틀린 식을 모의 실행으로 발견하면 여기에 등록돼요.', col.x, y + 10, 15, C.dim);
+  y += 32;
+  TRAP_IDS.forEach((id) => {
+    const t = MISSION.traps[id], got = state.save.codex.includes(id), h = 84;
+    rr(col.x, y, col.w, h, 12, C.panel, got ? C.unit : C.grid, 1.5, got ? null : [6, 5]);
+    text(got ? t.name : '???', col.x + 16, y + 26, 18, got ? C.ink : C.dim, 'left', 700);
+    wrap(got ? t.why : '아직 발견하지 못한 함정', col.w - 32, 15).slice(0, 2).forEach((ln, i) => text(ln, col.x + 16, y + 52 + i * 20, 15, C.dim));
+    y += h + 8;
+  });
+}
+
+// 작전 장면: 직선 도로 (2D). positionsAt(t)은 3D 장면에서도 그대로 쓴다
+function renderScene(r) {
+  const m = state.m, p = m.p;
+  state.sceneRect = r;
+  rr(r.x, r.y, r.w, r.h, 14, '#0B1220', state.lock > 0 ? C.bad : C.grid, state.lock > 0 ? 3 : 1.5);
+  ctx.save(); ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 14); ctx.clip();
+  const maxKm = Math.max(p.h, m.stage === 'twist' ? MISSION.positionsAt(p, trueT()).unit : 0) * CONFIG.trackMargin;
+  const x0 = r.x + 30, x1 = r.x + r.w - 22, gy = r.y + r.h * 0.5 + 6;
+  const px = (km) => x0 + (km / maxKm) * (x1 - x0);
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 8; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x0, gy); ctx.lineTo(r.x + r.w + 20, gy); ctx.stroke();
+  for (let km = 0; km <= maxKm + 1e-9; km += 10) {
+    ctx.strokeStyle = C.dim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px(km), gy + 8); ctx.lineTo(px(km), gy + 14); ctx.stroke();
+    text(String(km), px(km), gy + 26, 13, C.dim, 'center');
+  }
+  text('km', r.x + r.w - 10, gy + 44, 12, C.dim, 'right');
+  // 관제센터(출발지)와 병원
+  rr(x0 - 9, gy - 20, 18, 16, 3, C.grid, C.dim); text('X', x0, gy - 12, 11, C.amber, 'center', 800);
+  const hx = px(p.h);
+  rr(hx - 11, gy - 30, 22, 24, 4, '#1D2B47', C.ink); text('+', hx, gy - 18, 18, C.bad, 'center', 800);
+  text('병원', hx, gy - 42, 13, C.ink, 'center', 700);
+  // 유닛
+  let pos = MISSION.positionsAt(p, m.sceneT);
+  if (m.direct) pos = { target: Math.min(pos.target, p.h), unit: Math.min(pos.unit, p.h) };
+  const tx = px(pos.target), ux = px(pos.unit), off = (x) => x > r.x + r.w + 12;
+  const ghost = m.ghost && m.sceneT > 0;
+  ctx.globalAlpha = ghost ? 0.55 : 1;
+  if (m.sceneT > 0) {                                   // 지나온 길
+    ctx.setLineDash(ghost ? [5, 5] : []); ctx.lineWidth = 3;
+    ctx.strokeStyle = C.target; ctx.beginPath(); ctx.moveTo(px(p.v1 * p.d / 60), gy); ctx.lineTo(Math.min(tx, r.x + r.w), gy); ctx.stroke();
+    ctx.strokeStyle = C.unit; ctx.beginPath(); ctx.moveTo(x0, gy - 34); ctx.lineTo(Math.min(ux, r.x + r.w), gy - 34); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  const met = Math.abs(pos.unit - pos.target) < 1e-9 && m.sceneT > 0;
+  if (!off(ux)) {                                       // 드론: 각진 모양, 길 위를 난다
+    ctx.strokeStyle = C.unit; ctx.lineWidth = 1; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(ux, gy - 26); ctx.lineTo(ux, gy - 4); ctx.stroke(); ctx.setLineDash([]);
+    const dy = gy - 34 + (state.anim ? Math.sin(state.time * 16) * 1.5 : 0);
+    ctx.fillStyle = C.unit; ctx.beginPath(); ctx.moveTo(ux + 10, dy); ctx.lineTo(ux - 8, dy - 7); ctx.lineTo(ux - 8, dy + 7); ctx.closePath(); ctx.fill();
+    ctx.fillRect(ux - 12, dy - 10, 9, 2.5); ctx.fillRect(ux + 2, dy - 10, 9, 2.5);
+  }
+  if (!off(tx)) {                                       // 구급차: 둥근 모양
+    rr(tx - 12, gy - 9, 24, 15, 6, C.target); ctx.fillStyle = C.bg; ctx.fillRect(tx - 1.5, gy - 6, 3, 9); ctx.fillRect(tx - 4.5, gy - 3, 9, 3);
+  }
+  ctx.globalAlpha = 1;
+  if (met && !off(ux)) { ctx.strokeStyle = C.good; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(ux, gy - 16, 24, 0, 7); ctx.stroke(); }
+  ctx.restore();
+  if (off(ux)) text(`드론 → ${fmtKm(pos.unit)}`, r.x + r.w - 12, r.y + 38, 14, C.unit, 'right', 700);
+  if (off(tx)) text(`구급차 → ${fmtKm(pos.target)}`, r.x + r.w - 12, r.y + 56, 14, C.target, 'right', 700);
+  text(`드론 출발 후 ${fmtTime(m.sceneT)}`, r.x + 12, r.y + 18, 15, C.ink, 'left', 700);
+  if (state.scene === 'sim') text('모의 실행', r.x + r.w - 12, r.y + 18, 14, C.unit, 'right', 700);
+  if (state.scene === 'exec') text('작전 실행 중', r.x + r.w - 12, r.y + 18, 14, C.amber, 'right', 700);
+  if (m.readout && state.scene !== 'sim' && state.scene !== 'exec') {
+    const col = m.readout.kind === 'correct' ? C.good : m.readout.kind === 'mismatch' ? C.ink : C.bad;
+    const n = m.readout.lines.length;
+    m.readout.lines.forEach((ln, i) => text(ln, r.x + 12, r.y + r.h - 14 - (n - 1 - i) * 20, 14, i === 0 ? C.dim : i === n - 1 ? col : C.ink, 'left', i === 0 ? 500 : 700));
+  }
+}
+
+function conditionCard(col, y) {
+  const m = state.m, p = m.p;
+  rr(col.x, y, col.w, 58, 12, C.panel, C.grid);
+  text(`구급차 시속 ${p.v1} km · 먼저 출발`, col.x + 14, y + 18, 15, C.target, 'left', 700);
+  text(`드론 ${p.d}분 뒤 출발 · 시속 ${p.v2} km`, col.x + 14, y + 40, 15, C.unit, 'left', 700);
+  text(`병원 ${p.h} km`, col.x + col.w - 14, y + 18, 15, C.ink, 'right', 700);
+  return y + 66;
+}
+function optionList(col, y, title, guide, options, onPick) {
+  if (guide) { wrap(guide, col.w - 8, 15).forEach((ln) => { text(ln, col.x + 4, y + 10, 15, C.amber); y += 22; }); y += 4; }
+  text(title, col.x + 4, y + 12, 19, C.ink, 'left', 800); y += 34;
+  options.forEach((label, i) => {
+    rr(col.x, y, col.w, 54, 12, C.panel, C.grid);
+    text(String(i + 1), col.x + 20, y + 27, 16, C.dim, 'center', 700);
+    text(label, col.x + 40, y + 27, 17, C.ink, 'left', 700);
+    state.buttons.push({ id: 'opt' + i, x: col.x, y, w: col.w, h: 54, onTap: () => onPick(i) });
     y += 62;
   });
 }
 
-// 장면: 직선 트랙
-function renderScene(r) {
-  const st = state.stage, t = st.type, p = st.p;
-  state.sceneRect = r;
-  rr(r.x, r.y, r.w, r.h, 14, C.stage, C.line);
-  ctx.save(); ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 14); ctx.clip();
-  const x0 = r.x + 34, x1 = r.x + r.w - 26, gy = r.y + r.h * 0.6;
-  const px = (km) => x0 + (km / st.maxKm) * (x1 - x0);
-  // 길과 눈금
-  ctx.strokeStyle = C.line; ctx.lineWidth = 8; ctx.lineCap = 'round';
-  ctx.beginPath(); ctx.moveTo(x0, gy); ctx.lineTo(r.x + r.w + 20, gy); ctx.stroke();
-  const tick = st.maxKm <= 3 ? 0.5 : 1;
-  for (let km = 0; km <= st.maxKm + 1e-9; km += tick) {
-    ctx.strokeStyle = C.dim; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px(km), gy + 8); ctx.lineTo(px(km), gy + 15); ctx.stroke();
-    text(trim(km), px(km), gy + 28, 13, C.dim, 'center');
-  }
-  text('km', x1 + 4, gy + 44, 13, C.dim, 'right');
-  // 집
-  ctx.fillStyle = C.ink; ctx.beginPath(); ctx.moveTo(x0 - 12, gy - 6); ctx.lineTo(x0, gy - 18); ctx.lineTo(x0 + 12, gy - 6); ctx.closePath(); ctx.fill();
-  ctx.fillRect(x0 - 8, gy - 6, 16, 6);
-  // 인물
-  const pos = t.positionsAt(p, st.sceneT), ax = px(pos.a), bx = px(pos.b);
-  const off = (x) => x > r.x + r.w + 16;
-  const met = Math.abs(pos.a - pos.b) < 1e-9 && st.sceneT > 0;
-  if (met) { ctx.strokeStyle = C.good; ctx.lineWidth = 2; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(ax, r.y + 34); ctx.lineTo(ax, gy + 8); ctx.stroke(); ctx.setLineDash([]); }
-  // 어긋남: 차이 구간 표시
-  if (st.finalGap && !met) {
-    const lo = Math.min(ax, bx), hi = Math.min(Math.max(ax, bx), r.x + r.w);
-    ctx.fillStyle = C.bad; ctx.globalAlpha = 0.16; ctx.fillRect(lo, gy - 5, hi - lo, 10); ctx.globalAlpha = 1;
-    ctx.strokeStyle = C.bad; ctx.lineWidth = 1.5;
-    for (let hx = lo + 4; hx < hi; hx += 8) { ctx.beginPath(); ctx.moveTo(hx, gy + 5); ctx.lineTo(hx + 5, gy - 5); ctx.stroke(); }
-    text(`${pos.b > pos.a ? t.names.b : t.names.a} +${fmtKm(Math.abs(pos.a - pos.b))}`, Math.min((lo + hi) / 2, r.x + r.w - 60), gy - 30, 15, C.bad, 'center', 700);
-  }
-  const bob = state.scene === 'playing' ? Math.sin(state.time * 18) * 2 : 0;
-  if (!off(ax)) { ctx.fillStyle = C.actorA; ctx.beginPath(); ctx.arc(ax, gy - 20 + bob, 11, 0, 7); ctx.fill(); text(t.names.a, ax, gy - 40 + bob, 13, C.actorA, 'center', 700); }
-  if (!off(bx)) { rr(bx - 11, gy - 9 - bob, 22, 22, 6, C.actorB); text(t.names.b, bx, gy + 48, 13, C.actorB, 'center', 700); }
-  ctx.restore();
-  // 화면 밖으로 나간 인물 안내
-  if (off(ax)) text(`${t.names.a} → ${fmtKm(pos.a)}`, r.x + r.w - 14, r.y + 44, 14, C.actorA, 'right', 700);
-  if (off(bx)) text(`${t.names.b} → ${fmtKm(pos.b)}`, r.x + r.w - 14, r.y + 64, 14, C.actorB, 'right', 700);
-  // 경과 시간
-  text(`준호 출발 후 ${fmtTime(st.sceneT)}`, r.x + 14, r.y + 20, 15, C.ink, 'left', 700);
-  if (state.scene === 'playing') text('탭하면 건너뛰기', r.x + r.w - 14, r.y + 20, 13, C.dim, 'right');
-}
-
-// 식 틀: 슬롯 위치를 계산하고 그린다
+// 식 틀
 function renderFrame(r) {
-  const st = state.stage;
-  setFont(18, 700);
-  st.cards.forEach((c) => { c.w = Math.max(CONFIG.cardMinSize + 8, ctx.measureText(c.label).width + 28); });
-  const slotW = Math.max(...st.cards.map((c) => c.w)) + 8, slotH = CONFIG.cardMinSize + 8, gap = 9;
-  setFont(24, 700);
-  const widths = st.frame.map((tok) => (typeof tok === 'object' ? slotW : ctx.measureText(tok).width));
+  const m = state.m, u = U();
+  const slotW = 62, slotH = 50, opW = 44, gap = 5;
+  setFont(22, 700);
+  const widths = u.frame.map((t) => (t.num !== undefined ? slotW : t.op !== undefined ? opW : ctx.measureText(t).width));
   const total = widths.reduce((a, b) => a + b, 0) + gap * (widths.length - 1);
-  const scale = Math.min(1, r.w / total);
-  let x = r.x + (r.w - total * scale) / 2 + (state.shake ? Math.sin(state.time * 60) * state.shake : 0);
+  const sc = Math.min(1, r.w / total);
+  let x = r.x + (r.w - total * sc) / 2 + (state.shake ? Math.sin(state.time * 60) * state.shake : 0);
   const cy = r.y + r.h / 2;
   state.slotRects = [];
-  st.frame.forEach((tok, i) => {
-    const w = widths[i] * scale;
-    if (typeof tok === 'object') {
-      const rect = { x, y: cy - slotH / 2, w, h: slotH };
-      state.slotRects[tok.slot] = rect;
-      rr(rect.x, rect.y, rect.w, rect.h, 10, 'rgba(31,42,68,0.04)', C.dim, 1.5, [6, 5]);
-      if (st.slots[tok.slot] === null) text('?', x + w / 2, cy, 22, C.dim, 'center', 700);
-    } else text(tok, x + w / 2, cy, 24 * scale, C.ink, 'center', 700);
-    x += w + gap * scale;
+  u.frame.forEach((t, i) => {
+    const w = widths[i] * sc;
+    if (t.num !== undefined) {
+      const rect = { x, y: cy - slotH * sc / 2, w, h: slotH * sc };
+      state.slotRects[t.num] = rect;
+      rr(rect.x, rect.y, rect.w, rect.h, 9, 'rgba(255,255,255,0.03)', C.dim, 1.5, [5, 4]);
+      if (m.nums[t.num] === null) text('?', x + w / 2, cy, 20, C.dim, 'center', 700);
+    } else if (t.op !== undefined) {
+      const v = m.ops[t.op];
+      rr(x, cy - 22 * sc, w, 44 * sc, 22 * sc, v ? C.panel : 'transparent', v ? C.amber : C.dim, 1.5, v ? null : [5, 4]);
+      text(v || '±', x + w / 2, cy, 22, v ? C.amber : C.dim, 'center', 700);
+      if (state.scene === 'build') state.buttons.push({ id: 'op' + t.op, x: x - 4, y: cy - 26, w: w + 8, h: 52, onTap: () => setOp(t.op) });
+    } else text(t, x + w / 2, cy, 22 * sc, C.ink, 'center', 700);
+    x += w + gap * sc;
   });
 }
-
-// 카드 목표 위치 계산 + 그리기
-function renderCards(handRect) {
-  const st = state.stage, hand = st.cards.filter((c) => c.where === 'hand'), gap = 10;
-  let rowY = handRect.y, i = 0;
-  while (i < hand.length) {                       // 줄바꿈하며 가운데 정렬
-    let j = i, rowW = 0;
-    while (j < hand.length && (j === i || rowW + gap + hand[j].w <= handRect.w)) { rowW += (j === i ? 0 : gap) + hand[j].w; j++; }
-    let x = handRect.x + (handRect.w - rowW) / 2;
-    for (let k = i; k < j; k++) { hand[k].tx = x; hand[k].ty = rowY; x += hand[k].w + gap; }
-    rowY += CONFIG.cardMinSize + gap; i = j;
-  }
-  st.cards.forEach((c) => {
-    if (c.where !== 'hand') { const s = state.slotRects[c.where]; c.tx = s.x + (s.w - c.w) / 2; c.ty = s.y + (s.h - c.h) / 2; }
-  });
+// 카드 목표 위치와 그리기
+function renderCards(handRect, hidden) {
+  const m = state.m, hand = m.cards.filter((c) => c.where === 'hand'), gap = 8;
+  const cw = Math.min(84, (handRect.w - gap * 3) / 4);
+  const rowW = hand.length * cw + (hand.length - 1) * gap;
+  hand.forEach((c, i) => { c.tx = handRect.x + (handRect.w - rowW) / 2 + i * (cw + gap); c.ty = hidden ? H + 60 : handRect.y; c.tw = cw; c.th = 60; });
+  m.cards.forEach((c) => { if (c.where !== 'hand') { const s = state.slotRects[c.where]; if (s) { c.tx = s.x + 2; c.ty = s.y + 2; c.tw = s.w - 4; c.th = s.h - 4; } } });
   const dragging = state.drag && state.drag.moved ? state.drag.id : null;
-  const order = [...st.cards].sort((a, b) => (a.id === dragging) - (b.id === dragging));
-  for (const c of order) {
-    const lift = c.id === dragging;
-    if (lift) { ctx.shadowColor = 'rgba(0,0,0,0.25)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 6; }
-    rr(c.x, c.y, c.w, c.h, 10, C.card, C.ink, 2);
+  [...m.cards].sort((a, b) => (a.id === dragging) - (b.id === dragging)).forEach((c) => {
+    const inSlot = c.where !== 'hand', sel = m.convMode && m.convSel === c.id;
+    if (c.id === dragging) { ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 6; }
+    rr(c.x, c.y, c.w, c.h, 9, C.panel, sel ? C.amber : c.conv ? C.amber : C.ink, sel ? 3 : 2);
     ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
-    text(c.label, c.x + c.w / 2, c.y + c.h / 2 + 1, 18, C.ink, 'center', 700);
-    if (c.where === 'hand' && state.scene === 'stage') {
-      const n = hand.indexOf(c) + 1;
-      if (n > 0 && W > 700) text(String(n), c.x + 9, c.y + 10, 11, C.dim, 'center', 700);   // 넓은 화면: 숫자키 안내
+    if (inSlot || c.h < 54) text(rFmt(c.val), c.x + c.w / 2, c.y + c.h / 2 + 1, 18, c.conv ? C.amber : C.ink, 'center', 700);
+    else {
+      text(rFmt(c.val), c.x + c.w / 2, c.y + 22, 20, c.conv ? C.amber : C.ink, 'center', 700);
+      text(c.conv ? `${rFmt(c.base)} ${c.conv}` : c.cap, c.x + c.w / 2, c.y + 45, 12, C.dim, 'center');
     }
-  }
+  });
 }
 
-function measureResult(w) {
-  const res = state.result;
-  const lines = wrapPlain(res.lines.join(' '), w - 40, 16);
-  const hl = res.hint ? wrapPlain('힌트: ' + res.hint, w - 64, 16, 700) : [];
-  const h = 52 + lines.length * 24 + (hl.length ? hl.length * 24 + 28 : 0) + 12 + 52 + 16;
-  return { lines, hl, h };
-}
-function renderResult(r, m) {
-  const res = state.result, good = res.kind === 'correct';
-  rr(r.x, r.y, r.w, r.h, 16, C.stage, good ? C.good : C.bad, 2.5);
-  let y = r.y + 28;
-  text(res.title, r.x + 20, y, 22, good ? C.good : C.bad, 'left', 800);
-  if (good) stars(res.stars, r.x + r.w - 56, y, 24);
-  y += 24;
-  m.lines.forEach((ln) => { text(ln, r.x + 20, y + 12, 16, C.ink); y += 24; });
-  if (m.hl.length) {
-    y += 8;
-    rr(r.x + 16, y, r.w - 32, m.hl.length * 24 + 12, 10, 'rgba(242,177,52,0.18)');
-    m.hl.forEach((ln, i) => text(ln, r.x + 28, y + 18 + i * 24, 16, C.ink, 'left', 700));
-  }
-  const last = state.stageIndex + 1 >= STAGES.length;
-  button('result', r.x + 16, r.y + r.h - 68, r.w - 32, 52, good ? (last ? '목록으로' : '다음 스테이지') : '다시 해 보기', resultAction,
-    { fill: good ? C.good : C.ink });
-}
-
-function renderStage() {
-  const st = state.stage, col = column();
-  renderTopBar(`${st.def.id} ${st.def.kind}`);
-  let y = 58;
-  // 문제 카드
-  const lines = richText(st.type.problem(st.p), 0, 0, col.w - 28, 16, 24, false);
-  const ph = lines * 24 + 20;
-  rr(col.x, y, col.w, ph, 12, C.stage, C.line);
-  richText(st.type.problem(st.p), col.x + 14, y + 10, col.w - 28, 16, 24);
-  y += ph + 8;
-  text(st.type.unknown, col.x + 4, y + 12, 16, C.actorB, 'left', 700);
-  y += 30;
-  // 아래쪽 고정 영역 높이를 뺀 나머지를 장면에 준다
-  const inResult = state.scene === 'result';
-  const m = inResult ? measureResult(col.w) : null;
-  const bottomH = inResult ? 72 + 8 + m.h + 10 : 24 + 72 + 8 + (CONFIG.cardMinSize * 2 + 10) + 12 + 56 + 14;
-  const sceneH = Math.max(130, Math.min(230, H - y - bottomH - 8));
-  renderScene({ x: col.x, y, w: col.w, h: sceneH });
-  y += sceneH + 8;
-  if (!inResult) { text(st.def.label, col.x + 4, y + 12, 16, C.dim); y += 24; }
-  renderFrame({ x: col.x, y, w: col.w, h: 72 });
-  y += 72 + 8;
-  if (inResult) {
-    renderCards({ x: col.x, y: H + 40, w: col.w, h: 0 });    // 손패는 화면 아래로 내려 둔다
-    renderResult({ x: col.x, y, w: col.w, h: Math.max(m.h, H - y - 10) }, m);
+function renderMission() {
+  const m = state.m, col = column(), s = state.scene;
+  const stageName = STAGES.find((st) => st.key === m.stage).name;
+  topBar(`${MISSION.name} · ${stageName}`);
+  let y = conditionCard(col, 56);
+  const train = m.stage === 'train';
+  if (s === 'call' || s === 'brief1' || s === 'brief2') {
+    const sh = Math.max(120, Math.min(170, H - y - 330));
+    renderScene({ x: col.x, y, w: col.w, h: sh }); y += sh + 12;
+    if (s === 'brief1') optionList(col, y, '① 무엇을 x로 놓을까?', train ? '팀장: 우리가 아직 모르는 게 뭐지? 그걸 x로 놓자. 길은 하나가 아니야.' : '',
+      MISSION.unknowns.map((u) => u.label), chooseUnknown);
+    else if (s === 'brief2') optionList(col, y, '② 무엇이 같아질까?', train ? '팀장: 드론이 구급차를 만나는 순간을 떠올려 봐.' : '',
+      MISSION.relSets[U().relSet].map((r) => str(r.t, m.p)), chooseRelation);
     return;
   }
-  const handRect = { x: col.x, y, w: col.w, h: CONFIG.cardMinSize * 2 + 10 };
-  y += handRect.h + 12;
+  // build / sim / exec / judge
+  rr(col.x, y, col.w, 32, 10, 'transparent', C.grid);
+  text(U().short, col.x + 12, y + 16, 15, C.amber, 'left', 700);
+  if (s === 'build') { text('바꾸기', col.x + col.w - 12, y + 16, 14, C.dim, 'right'); state.buttons.push({ id: 'rebrief', x: col.x, y, w: col.w, h: 32, onTap: () => { state.scene = 'brief1'; } }); }
+  y += 40;
+  const lower = 64 + 6 + 60 + 8 + 48 + 8 + 56 + 12;
+  const sh = Math.max(150, Math.min(270, H - y - lower - 8));
+  renderScene({ x: col.x, y, w: col.w, h: sh }); y += sh + 6;
+  renderFrame({ x: col.x, y, w: col.w, h: 64 }); y += 64 + 6;
+  if (s === 'judge') {
+    renderCards({ x: col.x, y, w: col.w, h: 60 }, true);
+    text('어떤 작전을 승인할까?', col.x + 4, y + 12, 18, C.ink, 'left', 800); y += 32;
+    [`길 위 ${fmtKm(m.judge.meet)} 지점에서 전달한다`, `드론을 병원(${m.p.h} km)으로 직행시킨다`].forEach((label, i) => {
+      rr(col.x, y, col.w, 54, 12, C.panel, C.amber);
+      text(String(i + 1), col.x + 20, y + 27, 16, C.dim, 'center', 700); text(label, col.x + 40, y + 27, 16, C.ink, 'left', 700);
+      state.buttons.push({ id: 'judge' + i, x: col.x, y, w: col.w, h: 54, onTap: () => chooseJudge(i) });
+      y += 62;
+    });
+    return;
+  }
+  const handRect = { x: col.x, y, w: col.w, h: 60 };
   renderCards(handRect);
-  const ready = slotsFull() && state.scene === 'stage';
-  button('reset', col.x, y, 56, 56, '↺', resetSlots, { fill: C.stage, stroke: C.line, color: C.ink, size: 24, enabled: state.scene === 'stage' });
-  button('play', col.x + 68, y, col.w - 68, 56, state.scene === 'playing' ? '재생 중…' : '▶ 재생', playEquation, { enabled: ready, size: 20, fill: ready ? C.actorB : C.line });
+  y += 60 + 8;
+  const busy = s !== 'build';
+  if (m.convMode) {
+    const bw = (col.w - 24) / 4, on = !!m.convSel && !busy;
+    button('c-div', col.x, y, bw, 48, '÷ 60', () => convert(m.convSel, '÷60'), { enabled: on, fill: on ? C.amber : C.grid });
+    button('c-mul', col.x + bw + 8, y, bw, 48, '× 60', () => convert(m.convSel, '×60'), { enabled: on, fill: on ? C.amber : C.grid });
+    button('c-undo', col.x + (bw + 8) * 2, y, bw, 48, '원래대로', () => convert(m.convSel, null), { enabled: on, fill: C.panel, stroke: C.dim, color: C.ink, size: 15 });
+    button('c-close', col.x + (bw + 8) * 3, y, bw, 48, '닫기', () => { m.convMode = false; m.convSel = null; }, { fill: C.panel, stroke: C.dim, color: C.ink, size: 15 });
+  } else {
+    button('conv', col.x, y, col.w * 0.5 - 4, 48, '단위 변환기', () => { m.convMode = true; m.convSel = null; }, { enabled: !busy, fill: C.panel, stroke: C.amber, color: C.amber, size: 16 });
+    button('ask', col.x + col.w * 0.5 + 4, y, col.w * 0.5 - 4, 48, '팀장에게 묻기', askLead, { enabled: !busy, fill: C.panel, stroke: C.dim, color: C.ink, size: 16 });
+  }
+  y += 48 + 8;
+  const ready = slotsFull() && !busy, half = col.w * 0.5 - 4;
+  button('sim', col.x, y, half, 56, s === 'sim' ? '모의 실행 중…' : '모의 실행', simulate, { enabled: ready, size: 18 });
+  button('approve', col.x + half + 8, y, half, 56, s === 'exec' ? '실행 중…' : '승인 (길게)', approve, { enabled: ready, size: 18, fill: ready ? C.amber : C.grid, hold: true });
+}
+
+function renderDebrief() {
+  const m = state.m, col = column(), g = m.result.grade, cx = W / 2;
+  topBar('작전 평가', false);
+  skyline(col.x, 70, col.w, 110, Math.min(1, stagesDone() / 12 + 0.02 + (1 - state.lightUp / CONFIG.lightUpDuration) * 0.1));
+  let y = 210;
+  text(g, cx, y + 30, 84, g === 'S' ? C.amber : C.good, 'center', 800); y += 96;
+  text(`${MISSION.name} · ${STAGES.find((s) => s.key === m.stage).name} 완료`, cx, y, 18, C.ink, 'center', 700); y += 34;
+  const rows = [['사용한 미지수', U().label], ['모의 실행', `${m.sims}회`], ['작전 승인', `${m.approvals}회`]];
+  if (m.helped) rows.push(['도움', '팀장에게 물어봄']);
+  if (m.newCodex.length) rows.push(['새 함정 도감', m.newCodex.map((id) => MISSION.traps[id].name).join(', ')]);
+  if (m.maruPiece) rows.push(['마루의 기억', '+1']);
+  if (m.result.newlyDone) rows.push(['교통 구역', '불이 더 켜졌다']);
+  rows.forEach(([k, v]) => { text(k, col.x + 8, y + 12, 16, C.dim); wrap(v, col.w * 0.6, 16, 700).forEach((ln, i) => text(ln, col.x + col.w - 8, y + 12 + i * 22, 16, C.ink, 'right', 700)); y += 30; });
+  const last = m.stage === STAGES[STAGES.length - 1].key;
+  button('next', col.x, H - 132, col.w, 54, last ? '지도로' : `다음: ${STAGES[STAGES.findIndex((s) => s.key === m.stage) + 1].name}`, nextAfterDebrief, { fill: C.amber, size: 18 });
+  if (!last) button('tocity', col.x, H - 70, col.w, 50, '지도로 돌아가기', () => { state.scene = 'city'; }, { fill: C.panel, stroke: C.dim, color: C.ink });
+}
+
+function renderDialog() {
+  const d = state.dialog, col = column(), line = d.lines[d.i], who = WHO[line.who];
+  const shown = line.text.slice(0, Math.floor(d.chars));
+  const lines = wrap(line.text, col.w - (line.who === 'sys' ? 36 : 96), 17), h = Math.max(96, lines.length * 26 + 56);
+  const y = H - h - 14;
+  ctx.fillStyle = 'rgba(8,13,24,0.55)'; ctx.fillRect(0, 0, W, H);
+  rr(col.x, y, col.w, h, 14, C.panel, who.color, 2);
+  let tx = col.x + 18;
+  if (line.who !== 'sys') { avatar(line.who, col.x + 40, y + h / 2, 44); tx = col.x + 78; text(who.name, tx, y + 20, 14, who.color, 'left', 700); }
+  let left = shown.length;
+  lines.forEach((ln, i) => { const part = ln.slice(0, Math.max(0, left)); left -= ln.length + 1; text(part, tx, y + (line.who === 'sys' ? 30 : 46) + i * 26, 17, line.who === 'sys' ? C.amber : C.ink, 'left', line.who === 'sys' ? 700 : 500); });
+  if (d.chars >= line.text.length && Math.sin(state.time * 6) > 0) text('▼', col.x + col.w - 20, y + h - 16, 13, C.dim, 'center');
+  state.buttons = [];
+  if (d.lines.length > 2) button('skip', col.x + col.w - 96, y - 44, 96, 38, '건너뛰기', () => advanceDialog(true), { fill: C.panel, stroke: C.dim, color: C.dim, size: 14 });
 }
 
 function render() {
   state.buttons = [];
   ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
-  if (state.scene === 'title') renderTitle();
-  else if (state.scene === 'map') renderMap();
-  else renderStage();
+  const s = state.scene;
+  if (s === 'title') renderTitle();
+  else if (s === 'intro') { skyline(0, H * 0.4, W, H * 0.4, 0.03); ctx.fillStyle = '#0A111E'; ctx.fillRect(0, H * 0.8, W, H * 0.2); }
+  else if (s === 'city') renderCity();
+  else if (s === 'codex') renderCodex();
+  else if (s === 'debrief') renderDebrief();
+  else renderMission();
   for (const q of state.particles) { ctx.globalAlpha = Math.min(1, q.life); ctx.fillStyle = q.color; ctx.fillRect(q.x - 4, q.y - 4, 8, 8); }
   ctx.globalAlpha = 1;
+  if (state.dialog) renderDialog();
 }
 
-// ---- loop: 고정 타임스텝 ----
+// ---- loop ----
 const STEP = 1 / 60;
 let last = performance.now(), acc = 0;
 function frame(now) {
@@ -661,7 +963,7 @@ resize();
 requestAnimationFrame(frame);
 
 // 디버그 핸들 (플레이테스트 자동화용)
-window.__game = { CONFIG, state, STAGES, api: { openStage, placeCard, removeCard, playEquation, skipPlay, resultAction, solve, equivalent, R, L, rFmt } };
+window.__game = { CONFIG, state, MISSION, STAGES, api: { startStage, chooseUnknown, chooseRelation, placeCard, removeCard, setOp, convert, simulate, approve, chooseJudge, advanceDialog, askLead, evaluate, nextAfterDebrief, primaryAction } };
 </script>
 </body>
 </html>
