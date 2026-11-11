@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>게임 템플릿</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f1020; overflow: hidden; touch-action: none; }
+  canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; }
+  body { font-family: system-ui, "Noto Sans KR", sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="게임 화면"></canvas>
+<script>
+/* =====================================================================
+ * Claude Code 게임 스튜디오 — 시작 템플릿
+ * 구조: CONFIG → state → input → sfx → update(dt) → render() → loop
+ * 예시 게임: 떨어지는 블록 피하기. 이 부분을 GDD에 맞게 교체한다.
+ * ===================================================================== */
+
+// ---- CONFIG: 모든 조정 수치 (GDD 수치 표와 1:1) ----
+const CONFIG = {
+  title: '게임 템플릿',
+  storageKey: 'template-best',
+  playerSpeed: 320,        // px/s
+  playerSize: 28,          // px
+  hazardSpawnEvery: 0.7,   // s, 시작 생성 간격
+  hazardSpawnMin: 0.22,    // s, 최소 생성 간격
+  hazardSpeed: 180,        // px/s, 시작 낙하 속도
+  hazardSpeedGain: 6,      // px/s 증가량(초당)
+  hazardSize: [18, 46],    // px, 최소~최대
+  rampPerSecond: 0.012,    // 생성 간격 감소율
+  colors: { bg: '#0f1020', player: '#5eead4', hazard: '#f472b6', text: '#f8fafc', dim: '#94a3b8' },
+  audio: { volume: 0.3 },
+};
+
+// ---- state ----
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+const state = {
+  scene: 'title',          // title | playing | paused | gameover
+  time: 0, score: 0, best: loadBest(),
+  player: { x: 0, y: 0 },
+  hazards: [], spawnTimer: 0, shake: 0, muted: false,
+};
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = canvas.clientWidth || window.innerWidth; H = canvas.clientHeight || window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  state.player.y = H - 60;
+  state.player.x = Math.min(Math.max(state.player.x || W / 2, 0), W);
+}
+window.addEventListener('resize', resize);
+
+function loadBest() { try { return Number(localStorage.getItem(CONFIG.storageKey)) || 0; } catch { return 0; } }
+function saveBest(v) { try { localStorage.setItem(CONFIG.storageKey, String(v)); } catch {} }
+
+// ---- input: 키보드 + 포인터(터치) ----
+const input = { left: false, right: false, pointerX: null };
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft' || e.key === 'a') input.left = true;
+  if (e.key === 'ArrowRight' || e.key === 'd') input.right = true;
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); primaryAction(); }
+  if (e.key === 'Escape' || e.key === 'p') togglePause();
+  if (e.key === 'm') state.muted = !state.muted;
+});
+window.addEventListener('keyup', (e) => {
+  if (e.key === 'ArrowLeft' || e.key === 'a') input.left = false;
+  if (e.key === 'ArrowRight' || e.key === 'd') input.right = false;
+});
+canvas.addEventListener('pointerdown', (e) => { input.pointerX = e.clientX; if (state.scene !== 'playing') primaryAction(); });
+canvas.addEventListener('pointermove', (e) => { if (e.buttons || e.pointerType === 'touch') input.pointerX = e.clientX; });
+canvas.addEventListener('pointerup', () => { input.pointerX = null; });
+document.addEventListener('visibilitychange', () => { if (document.hidden && state.scene === 'playing') state.scene = 'paused'; });
+
+function primaryAction() {
+  sfx.unlock();
+  if (state.scene === 'title' || state.scene === 'gameover') startGame();
+  else if (state.scene === 'paused') state.scene = 'playing';
+}
+function togglePause() {
+  if (state.scene === 'playing') state.scene = 'paused';
+  else if (state.scene === 'paused') state.scene = 'playing';
+}
+
+// ---- sfx: WebAudio 합성 (외부 파일 없음) ----
+const sfx = {
+  ac: null,
+  unlock() { if (!this.ac) { try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch {} } this.ac?.resume?.(); },
+  play(name) {
+    if (state.muted || !this.ac) return;
+    const presets = { start: [440, 880, 0.15, 'triangle'], hit: [220, 60, 0.35, 'sawtooth'] };
+    const [f0, f1, dur, type] = presets[name] || presets.start;
+    const t = this.ac.currentTime, o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(CONFIG.audio.volume, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(this.ac.destination); o.start(t); o.stop(t + dur);
+  },
+};
+
+// ---- game logic ----
+function startGame() {
+  Object.assign(state, { scene: 'playing', time: 0, score: 0, hazards: [], spawnTimer: 0, shake: 0 });
+  state.player.x = W / 2;
+  sfx.play('start');
+}
+
+function update(dt) {
+  if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 30);
+  if (state.scene !== 'playing') return;
+  state.time += dt;
+  state.score = Math.floor(state.time * 10);
+
+  const p = state.player;
+  let dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  if (input.pointerX !== null && Math.abs(input.pointerX - p.x) > 4) dir = Math.sign(input.pointerX - p.x);
+  p.x = Math.min(Math.max(p.x + dir * CONFIG.playerSpeed * dt, CONFIG.playerSize / 2), W - CONFIG.playerSize / 2);
+
+  const every = Math.max(CONFIG.hazardSpawnMin, CONFIG.hazardSpawnEvery - state.time * CONFIG.rampPerSecond);
+  state.spawnTimer -= dt;
+  if (state.spawnTimer <= 0) {
+    state.spawnTimer = every;
+    const [a, b] = CONFIG.hazardSize, s = a + Math.random() * (b - a);
+    state.hazards.push({ x: Math.random() * W, y: -s, s });
+  }
+  const speed = CONFIG.hazardSpeed + state.time * CONFIG.hazardSpeedGain;
+  for (const h of state.hazards) h.y += speed * dt;
+  state.hazards = state.hazards.filter((h) => h.y - h.s < H);
+
+  const r = CONFIG.playerSize / 2;
+  for (const h of state.hazards) {
+    if (Math.abs(h.x - p.x) < r + h.s / 2 && Math.abs(h.y - p.y) < r + h.s / 2) { gameOver(); break; }
+  }
+}
+
+function gameOver() {
+  state.scene = 'gameover'; state.shake = 12; sfx.play('hit');
+  if (state.score > state.best) { state.best = state.score; saveBest(state.best); }
+}
+
+// ---- render ----
+function text(str, x, y, size, color = CONFIG.colors.text, align = 'center') {
+  ctx.fillStyle = color; ctx.font = `700 ${size}px system-ui, "Noto Sans KR", sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(str, x, y);
+}
+
+function render() {
+  const c = CONFIG.colors;
+  ctx.save();
+  ctx.fillStyle = c.bg; ctx.fillRect(0, 0, W, H);
+  if (state.shake) ctx.translate((Math.random() - 0.5) * state.shake, (Math.random() - 0.5) * state.shake);
+
+  ctx.fillStyle = c.hazard;
+  for (const h of state.hazards) ctx.fillRect(h.x - h.s / 2, h.y - h.s / 2, h.s, h.s);
+  if (state.scene !== 'title') {
+    ctx.fillStyle = c.player; ctx.beginPath();
+    ctx.arc(state.player.x, state.player.y, CONFIG.playerSize / 2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+
+  text(`점수 ${state.score}`, 16, 28, 18, c.text, 'left');
+  text(`최고 ${state.best}`, W - 16, 28, 18, c.dim, 'right');
+  if (state.muted) text('🔇', W / 2, 28, 18);
+
+  if (state.scene === 'title') {
+    text(CONFIG.title, W / 2, H / 2 - 30, 36);
+    text('Enter 또는 화면 탭으로 시작', W / 2, H / 2 + 20, 18, c.dim);
+    text('← → / 드래그 이동 · Esc 일시정지 · M 음소거', W / 2, H / 2 + 50, 16, c.dim);
+  } else if (state.scene === 'paused') {
+    text('일시정지', W / 2, H / 2, 32);
+    text('Enter 또는 탭으로 계속', W / 2, H / 2 + 40, 18, c.dim);
+  } else if (state.scene === 'gameover') {
+    text('게임 오버', W / 2, H / 2 - 20, 36);
+    text(`점수 ${state.score}`, W / 2, H / 2 + 22, 20);
+    text('Enter 또는 탭으로 다시 시작', W / 2, H / 2 + 56, 18, c.dim);
+  }
+}
+
+// ---- loop: 고정 타임스텝 ----
+const STEP = 1 / 60;
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min((now - last) / 1000, 0.1); last = now;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+
+// 디버그 핸들 (플레이테스트 자동화용)
+window.__game = { CONFIG, state, startGame };
+</script>
+</body>
+</html>
